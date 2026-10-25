@@ -86,7 +86,7 @@ var snapshotModelIDs = []string{
 	"claude-haiku-5-5",
 	"deepseek-v4-pro",
 	"deepseek-v4.1-flash",
-	"gemini-4-argon-contributor",
+	"gemini-4-argon",
 	"glm-5.1",
 	"glm-5.2",
 	"glm-5.3",
@@ -338,11 +338,14 @@ var priceBook = []Entry{
 		100001,
 		Rate{Input: 0.50, Output: 2.50, CacheRead: 0.05, CacheWrite: 0.625},
 	), Limits: Limits{Go: 15, GoPlus: 60}},
-	{Model: "gemini-4-argon-contributor", Tiers: []Tier{{Rate: Rate{Input: 4.00, Output: 20.00, CacheRead: 0.20}}}, Limits: Limits{Go: 60, GoPlus: 240}},
+	{Model: "gemini-4-argon", Tiers: []Tier{{Rate: Rate{Input: 4.00, Output: 20.00, CacheRead: 0.20}}}, Limits: Limits{Go: 60, GoPlus: 240}},
 
 	// ------------------------------------------------------- retired models
 	// Still in the catalogue and still callable, but no longer in the Go list.
 	// Prices come from the Console list; no monthly Go limit is published.
+	// The old Gemini 4 Argon id was renamed; keep its rate so historical usage
+	// records stay priced.
+	legacyEntry("gemini-4-argon-contributor", Rate{Input: 4.00, Output: 20.00, CacheRead: 0.20}),
 	legacyEntry("glm-5.1", Rate{Input: 1.40, Output: 4.40, CacheRead: 0.26}),
 	legacyEntry("kimi-k2.6", Rate{Input: 0.95, Output: 4.00, CacheRead: 0.16}),
 	legacyEntry("minimax-m2.5", Rate{Input: 0.30, Output: 1.20, CacheRead: 0.06}),

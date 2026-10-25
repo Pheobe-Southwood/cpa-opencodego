@@ -154,10 +154,9 @@ plugins:
           enabled: true
           proxy: "proxy"
           aliases: ["DeepSeek-V4.1-Flash"]
-        "gemini-4-argon-contributor":
+        "gemini-4-argon":
           enabled: true
           proxy: "direct"
-          aliases: ["gemini-4-argon"]
     cpa-opencodego-responses: { enabled: true }
     cpa-opencodego-messages:  { enabled: true }
     cpa-opencodego-gemini:    { enabled: true }

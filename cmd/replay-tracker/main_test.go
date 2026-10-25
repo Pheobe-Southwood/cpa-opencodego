@@ -79,7 +79,7 @@ func TestTrackerRecordGeminiReasoningIsTPSOutput(t *testing.T) {
 	record, ok := trackerRecord(trackerRequest{
 		Time:            time.Date(2026, 10, 5, 5, 30, 0, 0, time.UTC),
 		Provider:        "cpa-opencodego-gemini",
-		Model:           "gemini-4-argon-contributor",
+		Model:           "gemini-4-argon",
 		OutputTokens:    20,
 		ReasoningTokens: 30,
 		LatencyNS:       uint64(2 * time.Second),

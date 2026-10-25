@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Pheobe-Southwood/cpa-opencodego/internal/abi"
@@ -88,6 +89,39 @@ func TestSummarizeUpstreamError(t *testing.T) {
 		if got := summarizeUpstreamError([]byte(body)); got != want {
 			t.Errorf("summarizeUpstreamError(%s) = %q, want %q", body, got, want)
 		}
+	}
+}
+
+// A 403 that the gateway raises for the request itself must not be reported as
+// a credential fault: CLIProxyAPI cools a key for 30 minutes on any 403, which
+// would take the whole model offline after one refused prompt.
+func TestUpstreamErrorKeepsRequestScoped403OutOfCredentialCooldown(t *testing.T) {
+	refusal := []byte(`{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`)
+	errRefusal := upstreamError(http.StatusForbidden, refusal, "keyg")
+	if got := abi.Status(errRefusal); got != http.StatusBadRequest {
+		t.Errorf("request-scoped refusal status = %d, want 400", got)
+	}
+	if strings.Contains(errRefusal.Error(), "[keyg]") {
+		t.Errorf("a request-scoped refusal must not be attributed to a key: %v", errRefusal)
+	}
+	if !strings.Contains(errRefusal.Error(), "Endpoint is unavailable") {
+		t.Errorf("the upstream message must be preserved: %v", errRefusal)
+	}
+
+	// A genuine credential/permission 403 keeps its status and failover hint.
+	authFailure := []byte(`{"error":{"type":"AuthError","message":"Forbidden"}}`)
+	errAuth := upstreamError(http.StatusForbidden, authFailure, "keyg")
+	if got := abi.Status(errAuth); got != http.StatusForbidden {
+		t.Errorf("credential 403 status = %d, want 403", got)
+	}
+	if !strings.Contains(errAuth.Error(), "[keyg]") {
+		t.Errorf("a credential 403 should name the key: %v", errAuth)
+	}
+
+	// A server error on another status keeps its status as well.
+	errUpstream := upstreamError(http.StatusBadGateway, []byte(`{"error":{"type":"server_error","message":"bad gateway"}}`), "keyg")
+	if got := abi.Status(errUpstream); got != http.StatusBadGateway {
+		t.Errorf("502 status = %d, want 502", got)
 	}
 }
 

@@ -144,19 +144,66 @@ func TestUsageGeminiAddsReasoningToOutputCost(t *testing.T) {
 	runtime := newStatsTestRuntime(t, roles.Chat)
 	sendUsage(t, runtime, pluginapi.UsageRecord{
 		Provider:    "cpa-opencodego-gemini",
-		Model:       "gemini-4-argon-contributor",
+		Model:       "gemini-4-argon",
 		RequestedAt: usageAt(),
 		Latency:     4 * time.Second,
 		Detail: pluginapi.UsageDetail{
 			OutputTokens: 1_000, ReasoningTokens: 1_000, TotalTokens: 2_000,
 		},
 	})
-	model := runtime.statsStore().Snapshot(time.Time{}).Models["gemini-4-argon-contributor"]
+	model := runtime.statsStore().Snapshot(time.Time{}).Models["gemini-4-argon"]
 	if model.Counter.CostNanoUSD != 40_000_000 {
 		t.Errorf("gemini cost = %d nanoUSD, want 40000000", model.Counter.CostNanoUSD)
 	}
 	if model.Counter.LatencyOutput != 2_000 || model.Counter.LatencyNano != int64(4*time.Second) {
 		t.Errorf("gemini TPS output/latency = %+v, want reasoning included", model.Counter)
+	}
+}
+
+// Historical rows written before the Gemini rename still carry the old id and
+// must keep the Gemini billing rule (reasoning billed as output), even though
+// the id is no longer in the catalogue.
+func TestUsageLegacyGeminiIDStillCountsAsGemini(t *testing.T) {
+	runtime := newStatsTestRuntime(t, roles.Chat)
+	sendUsage(t, runtime, pluginapi.UsageRecord{
+		Provider:    "cpa-opencodego-gemini",
+		Model:       "gemini-4-argon-contributor",
+		RequestedAt: usageAt(),
+		Detail: pluginapi.UsageDetail{
+			OutputTokens: 1_000, ReasoningTokens: 1_000, TotalTokens: 2_000,
+		},
+	})
+	model := runtime.statsStore().Snapshot(time.Time{}).Models["gemini-4-argon-contributor"]
+	if model.Counter.CostNanoUSD != 40_000_000 {
+		t.Errorf("legacy gemini cost = %d nanoUSD, want 40000000", model.Counter.CostNanoUSD)
+	}
+}
+
+// The chat face's suffix prefixes every companion face, so role detection must
+// pick the longest match instead of the first one in roles.All.
+func TestUsageRolePrefersMostSpecificFace(t *testing.T) {
+	cases := map[string]roles.Name{
+		"cpa-opencodego":                     roles.Chat,
+		"opencode-go":                        roles.Chat,
+		"plugin:cpa-opencodego":              roles.Chat,
+		"cpa-opencodego-gemini":              roles.Gemini,
+		"opencode-go-gemini":                 roles.Gemini,
+		"plugin:cpa-opencodego-messages":     roles.Messages,
+		"cpa-opencodego-responses":           roles.Responses,
+		"cpa-opencodego-gemini-extra-suffix": roles.Gemini,
+		"unrelated-provider":                 "",
+	}
+	for input, want := range cases {
+		got, ok := usageRole(input)
+		if want == "" {
+			if ok {
+				t.Errorf("usageRole(%q) = %q, want no match", input, got)
+			}
+			continue
+		}
+		if !ok || got != want {
+			t.Errorf("usageRole(%q) = (%q, %v), want %q", input, got, ok, want)
+		}
 	}
 }
 

@@ -443,10 +443,43 @@ func upstreamError(status int, body []byte, keyName string) error {
 	if message == "" {
 		message = http.StatusText(status)
 	}
+	if status == http.StatusForbidden && requestScopedUpstreamRefusal(body) {
+		// OpenCode Go refuses some requests with 403 server_error (for example
+		// when its provider's safety policy rejects the conversation). The
+		// refusal belongs to the request, not to the credential: retrying
+		// another key cannot help, and CLIProxyAPI treats every 403 as a
+		// credential fault and cools the key for 30 minutes. That turns one
+		// refused prompt into a blackout for every other user of the model, so
+		// report it as a non-retryable client error instead.
+		return abi.StatusErrorf(http.StatusBadRequest, "upstream_refused",
+			"OpenCode Go 上游拒绝了该请求（不是密钥或网络问题，通常是上游内容安全策略或端点策略）: %s", message)
+	}
 	if keyName != "" && retryableStatus(status) {
 		message = fmt.Sprintf("[%s] %s", keyName, message)
 	}
 	return abi.StatusErrorf(status, "upstream_error", "%s", message)
+}
+
+// requestScopedUpstreamRefusal reports whether a 403 body is the gateway
+// refusing this request rather than rejecting the credential. OpenCode Go
+// answers provider-side refusals with
+// {"error":{"type":"server_error","message":"Upstream request failed:
+// Endpoint is unavailable."}}. Authentication and permission failures use a
+// different error type, so they keep their 403 and their failover.
+func requestScopedUpstreamRefusal(body []byte) bool {
+	var envelope struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &envelope); errUnmarshal != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(envelope.Error.Type), "server_error") {
+		return false
+	}
+	return strings.Contains(envelope.Error.Message, "Endpoint is unavailable")
 }
 
 // summarizeUpstreamError extracts the human-readable message from an upstream

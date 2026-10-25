@@ -63,3 +63,21 @@ func TestIsCatalogued(t *testing.T) {
 		t.Error("a blank id must not report as catalogued")
 	}
 }
+
+// OpenCode Go renamed Gemini 4 Argon: the contributor suffix is gone and the
+// old id answers 410 ModelDeprecated, so only the new id may be advertised.
+func TestGeminiArgonUsesRenamedUpstreamID(t *testing.T) {
+	entry, ok := catalog["gemini-4-argon"]
+	if !ok {
+		t.Fatal("gemini-4-argon missing from the catalogue")
+	}
+	if entry.Family != roles.Gemini {
+		t.Errorf("gemini-4-argon family = %q, want gemini", entry.Family)
+	}
+	if IsCatalogued("gemini-4-argon-contributor") {
+		t.Error("the deprecated contributor id must not be advertised")
+	}
+	if !IsCatalogued("gemini-4-argon") {
+		t.Error("gemini-4-argon should be catalogued")
+	}
+}

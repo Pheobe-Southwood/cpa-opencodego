@@ -148,8 +148,10 @@ var messagesModels = []Model{
 // geminiModels are the models served by the GenAI generateContent endpoint.
 var geminiModels = []Model{
 	{
-		ID:            "gemini-4-argon-contributor",
-		DisplayName:   "Gemini 4 Argon Contributor",
+		// OpenCode Go renamed this model: the old
+		// "gemini-4-argon-contributor" id now answers 410 ModelDeprecated.
+		ID:            "gemini-4-argon",
+		DisplayName:   "Gemini 4 Argon",
 		ContextLength: 1000000,
 		Note:          "上游按请求数据训练且非 ZDR，请勿投喂敏感内容。",
 	},

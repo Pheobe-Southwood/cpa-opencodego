@@ -103,11 +103,11 @@ func TestPromptTierBoundary(t *testing.T) {
 func TestCostGeminiIncludesReasoningInOutput(t *testing.T) {
 	at := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	tokens := Tokens{Output: 1_000, Reasoning: 1_000}
-	got, _ := Cost("gemini-4-argon-contributor", tokens, true, true, at)
+	got, _ := Cost("gemini-4-argon", tokens, true, true, at)
 	if want := nanoDollars(2_000 * 20.0 / 1e6); got != want {
 		t.Errorf("gemini cost = %d, want %d", got, want)
 	}
-	without, _ := Cost("gemini-4-argon-contributor", tokens, true, false, at)
+	without, _ := Cost("gemini-4-argon", tokens, true, false, at)
 	if without >= got {
 		t.Errorf("reasoning must add to Gemini output cost: with=%d without=%d", got, without)
 	}
@@ -148,7 +148,7 @@ func TestMonthlyLimitsByPlan(t *testing.T) {
 		{"qwen3.8-max", PlanGo, 15, false, true},
 		{"qwen3.8-max", PlanGoPlus, 60, false, true},
 		{"deepseek-v4.1-flash", PlanGoPlus, 160, false, true},
-		{"gemini-4-argon-contributor", PlanGoPlus, 240, false, true},
+		{"gemini-4-argon", PlanGoPlus, 240, false, true},
 		{"step-5-preview", PlanGo, 60, false, true},
 		{"longcat-2.5-preview-free", PlanGoPlus, 0, true, true},
 		{"glm-5.1", PlanGo, 0, false, false},

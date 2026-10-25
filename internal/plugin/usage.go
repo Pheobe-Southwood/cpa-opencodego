@@ -76,13 +76,30 @@ func usageRole(value string) (roles.Name, bool) {
 	if trimmed == "" {
 		return "", false
 	}
+	// The chat face's plugin suffix ("cpa-opencodego") is a string prefix of
+	// every companion face ("cpa-opencodego-gemini", …). Matching role by role
+	// in declaration order would therefore attribute Gemini/Messages/Responses
+	// usage to Chat, which also decides whether reasoning tokens are billed as
+	// output. Prefer an exact id, then the longest matching prefix.
+	best := roles.Name("")
+	bestLen := -1
 	for _, role := range roles.All {
 		for _, candidate := range []string{role.Provider, role.PluginSuffix} {
 			lowered := strings.ToLower(candidate)
-			if trimmed == lowered || strings.HasPrefix(trimmed, lowered+"-") {
+			if lowered == "" {
+				continue
+			}
+			if trimmed == lowered {
 				return role.Name, true
 			}
+			if strings.HasPrefix(trimmed, lowered+"-") && len(lowered) > bestLen {
+				best = role.Name
+				bestLen = len(lowered)
+			}
 		}
+	}
+	if bestLen >= 0 {
+		return best, true
 	}
 	return "", false
 }
