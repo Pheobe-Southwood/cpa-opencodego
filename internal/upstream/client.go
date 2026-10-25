@@ -285,6 +285,7 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		body = forceStreamFlag(body, call.Stream)
 	}
 
+	transientRetried := false
 	for attempt := 0; attempt < 3; attempt++ {
 		request, errRequest := newUpstreamRequest(ctx, endpoint, body, call, credential, settings)
 		if errRequest != nil {
@@ -332,6 +333,13 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 				body = next
 			}
 			appliedRepairs = append(appliedRepairs, "reasoning-replay")
+			repaired = true
+		}
+
+		// 3. A bare or "feature unavailable" 400 is a gateway glitch; retry the
+		// unchanged body once before surfacing it to the client.
+		if !repaired && !transientRetried && isTransientRejection(peeked) {
+			transientRetried = true
 			repaired = true
 		}
 

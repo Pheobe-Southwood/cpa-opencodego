@@ -325,6 +325,34 @@ func isDeveloperRoleRejection(body []byte) bool {
 	return false
 }
 
+// isTransientRejection reports whether an upstream 400 looks like a gateway
+// glitch rather than a verdict on the request itself.
+//
+// Two shapes are observed on the OpenCode Go router:
+//   - a bare `{"model":"..."}` body with no error object at all;
+//   - "This response_format type is unavailable now" for json_schema requests
+//     that succeed when retried on another gateway node.
+//
+// Both are retried once without changing the request body.
+func isTransientRejection(body []byte) bool {
+	if bytes.Contains(bytes.ToLower(body), []byte("response_format type is unavailable")) {
+		return true
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
+	}
+	var object map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(trimmed, &object); errUnmarshal != nil {
+		return false
+	}
+	if _, hasError := object["error"]; hasError {
+		return false
+	}
+	_, hasModel := object["model"]
+	return hasModel && len(object) <= 2
+}
+
 // isReasoningReplayRejection reports whether an upstream 400 is the thinking
 // mode reasoning-passback check. The gateway answers it sporadically: the same
 // bytes can succeed on the next attempt, so the caller retries once.

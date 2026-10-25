@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -352,6 +353,87 @@ func TestIsDeveloperRoleRejection(t *testing.T) {
 		if got := isDeveloperRoleRejection(tc.body); got != tc.want {
 			t.Errorf("isDeveloperRoleRejection(%s) = %v, want %v", tc.body, got, tc.want)
 		}
+	}
+}
+
+func TestIsTransientRejection(t *testing.T) {
+	cases := []struct {
+		body []byte
+		want bool
+	}{
+		{[]byte(`{"model":"deepseek-v4.1-flash"}`), true},
+		{[]byte(`{"error":{"message":"invalid_request_error: This response_format type is unavailable now"}}`), true},
+		{[]byte(`{"error":{"message":"invalid_request_error: unsupported parameter"}}`), false},
+		{[]byte(`{"error":{"message":"model not found"}}`), false},
+		{[]byte(`not json`), false},
+	}
+	for _, tc := range cases {
+		if got := isTransientRejection(tc.body); got != tc.want {
+			t.Errorf("isTransientRejection(%s) = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteRetriesTransient400Once(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "opaque_model_body", body: `{"model":"deepseek-v4.1-flash"}`},
+		{name: "response_format_unavailable", body: `{"error":{"message":"invalid_request_error: This response_format type is unavailable now"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu   sync.Mutex
+				seen []capturedRequest
+			)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				raw, _ := io.ReadAll(request.Body)
+				mu.Lock()
+				seen = append(seen, capturedRequest{Path: request.URL.Path, Body: raw})
+				calls := len(seen)
+				mu.Unlock()
+				if calls == 1 {
+					writer.WriteHeader(http.StatusBadRequest)
+					_, _ = writer.Write([]byte(tc.body))
+					return
+				}
+				writer.WriteHeader(http.StatusOK)
+				_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+			}))
+			defer server.Close()
+
+			settings := config.Default()
+			settings.BaseURL = server.URL
+			settings.EndpointLayout = config.LayoutFamily
+			settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+			client := New(settings)
+			body := []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}}`)
+
+			result, errExecute := client.Execute(t.Context(), Call{
+				Role:  roles.ByName("chat"),
+				Model: "deepseek-v4.1-flash",
+				Body:  body,
+			})
+			if errExecute != nil {
+				t.Fatalf("Execute failed: %v", errExecute)
+			}
+			if result.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want 200", result.StatusCode)
+			}
+			if len(result.Repairs) != 0 {
+				t.Errorf("repairs = %v, want none for a transient retry", result.Repairs)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(seen) != 2 {
+				t.Fatalf("upstream calls = %d, want 2", len(seen))
+			}
+			if !bytes.Equal(seen[0].Body, seen[1].Body) {
+				t.Errorf("transient retry must not rewrite the body: %s vs %s", seen[0].Body, seen[1].Body)
+			}
+		})
 	}
 }
 
