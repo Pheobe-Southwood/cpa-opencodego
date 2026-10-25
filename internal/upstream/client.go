@@ -287,6 +287,13 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 
 	transientRetried := false
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// A retry must not reuse the connection that just failed: the
+			// gateway balances per connection, and a poisoned node kept
+			// rejecting a valid json_schema body on the same socket while the
+			// next connection succeeded.
+			client.CloseIdleConnections()
+		}
 		request, errRequest := newUpstreamRequest(ctx, endpoint, body, call, credential, settings)
 		if errRequest != nil {
 			return nil, appliedRepairs, errRequest
