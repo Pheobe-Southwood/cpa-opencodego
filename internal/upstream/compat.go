@@ -296,13 +296,33 @@ func rawEnablesThinking(raw json.RawMessage) bool {
 	return false
 }
 
-// isDeveloperRoleRejection reports whether an upstream 400 rejection is caused
-// by the router gRPC frontend rejecting the Chat Completions "developer" role.
+// isDeveloperRoleRejection reports whether an upstream rejection is caused by
+// the gateway not accepting the Chat Completions "developer" role.
+//
+// The gateways behind OpenCode Go phrase the same rejection differently:
+//   - "chat message role `developer` is not supported by the router gRPC frontend"
+//   - "messages[0].role: unknown variant `developer`" (serde, often HTTP 422)
+//   - "developer is not one of ['system', 'assistant', 'user', 'tool']"
+//
+// Matching only the first wording left the other two as non-repairable client
+// errors even though the request was a legal Chat Completions request.
 func isDeveloperRoleRejection(body []byte) bool {
 	if !bytes.Contains(body, []byte("developer")) {
 		return false
 	}
-	return bytes.Contains(body, []byte("not supported"))
+	lower := bytes.ToLower(body)
+	for _, marker := range []string{
+		"not supported",
+		"unknown variant",
+		"is not one of",
+		"unsupported role",
+		"invalid role",
+	} {
+		if bytes.Contains(lower, []byte(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 // isReasoningReplayRejection reports whether an upstream 400 is the thinking

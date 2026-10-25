@@ -295,7 +295,7 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 			return nil, appliedRepairs, abi.StatusErrorf(http.StatusBadGateway, "upstream_unreachable",
 				"连接 OpenCode Go 失败: %v", errDo)
 		}
-		if response.StatusCode != http.StatusBadRequest || attempt == 2 || !call.Role.StripsStreamField() {
+		if !isRepairableRejection(response.StatusCode) || attempt == 2 || !call.Role.StripsStreamField() {
 			if response.StatusCode >= 200 && response.StatusCode < 300 {
 				if containsString(appliedRepairs, "reasoning-replay") {
 					c.markReasoningRepair(call.Session)
@@ -308,8 +308,15 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		_ = response.Body.Close()
 
 		repaired := false
-		// 1. Check developer role 400 rejection
-		if devMode == config.DeveloperRoleRetryOnly && !containsString(appliedRepairs, "developer-role") && isDeveloperRoleRejection(peeked) {
+		// 1. Check developer role rejection. Besides the explicit wordings the
+		// gateway can hide the same rejection behind an opaque 422 (for example
+		// DeepSeek-V4-Pro answers "Endpoint is unavailable" for a developer
+		// message). In that case the request body is the only reliable signal.
+		developerRejected := isDeveloperRoleRejection(peeked)
+		if !developerRejected && response.StatusCode == http.StatusUnprocessableEntity {
+			developerRejected = bytes.Contains(body, []byte(`"developer"`))
+		}
+		if devMode == config.DeveloperRoleRetryOnly && !containsString(appliedRepairs, "developer-role") && developerRejected {
 			next := normalizeDeveloperRoles(call.Role, body, true)
 			if !bytes.Equal(next, body) {
 				body = next
@@ -336,6 +343,17 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 	}
 
 	return nil, appliedRepairs, errors.New("upstream retry ladder exhausted")
+}
+
+// isRepairableRejection reports whether an upstream rejection may be caused by
+// a request body the plugin can repair (developer role, reasoning replay).
+//
+// The OpenCode Go gateway does not use one status code for body validation
+// failures: the same "developer role is not supported" rejection arrives as
+// 400 from some nodes and as 422 from others. 4xx codes outside these two are
+// left untouched so authentication, quota and routing errors still surface.
+func isRepairableRejection(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
 }
 
 // newUpstreamRequest builds one upstream HTTP request. It is called once per

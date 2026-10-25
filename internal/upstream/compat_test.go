@@ -338,9 +338,15 @@ func TestIsDeveloperRoleRejection(t *testing.T) {
 	}{
 		{[]byte(`{"error":{"message":"chat message role ` + "`developer`" + ` is not supported by the router gRPC frontend"}}`), true},
 		{[]byte(`{"error":{"message":"role developer is not supported"}}`), true},
+		// DeepSeek gateway serde rejection, delivered as HTTP 422.
+		{[]byte(`{"error":{"message":"Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant ` + "`developer`" + `, expected one of ` + "`system`" + `, ` + "`user`" + `"}}`), true},
+		// Qwen gateway wording.
+		{[]byte(`{"error":{"message":"invalid_parameter_error: developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"}}`), true},
 		{[]byte(`{"error":{"message":"The reasoning_content in the thinking mode must be passed back"}}`), false},
 		{[]byte(`{"error":{"message":"developer role is great"}}`), false},
 		{[]byte(`{"error":{"message":"model not supported"}}`), false},
+		{[]byte(`{"error":{"message":"Endpoint is unavailable."}}`), false},
+		{[]byte(`{"error":{"message":"unknown variant ` + "`image_url`" + `"}}`), false},
 	}
 	for _, tc := range cases {
 		if got := isDeveloperRoleRejection(tc.body); got != tc.want {
@@ -402,6 +408,82 @@ func TestExecuteDeveloperRoleRetryOnlyLadder(t *testing.T) {
 	}
 	if !strings.Contains(string(seen[1].Body), `"role":"system"`) || strings.Contains(string(seen[1].Body), `"role":"developer"`) {
 		t.Errorf("attempt 2 must rewrite developer to system: %s", seen[1].Body)
+	}
+}
+
+func TestExecuteDeveloperRoleRepairsVariantRejections(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name:   "serde_422",
+			status: http.StatusUnprocessableEntity,
+			body:   `{"error":{"message":"Failed to deserialize the JSON body into the target type: messages[0].role: unknown variant ` + "`developer`" + `, expected one of ` + "`system`" + `, ` + "`user`" + `"}}`,
+		},
+		{
+			name:   "qwen_400",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"invalid_parameter_error: developer is not one of ['system', 'assistant', 'user', 'tool', 'function']"}}`,
+		},
+		{
+			name:   "opaque_422",
+			status: http.StatusUnprocessableEntity,
+			body:   `{"error":{"message":"server_error: Upstream request failed: Endpoint is unavailable."}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu   sync.Mutex
+				seen []capturedRequest
+			)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				raw, _ := io.ReadAll(request.Body)
+				mu.Lock()
+				seen = append(seen, capturedRequest{Path: request.URL.Path, Body: raw})
+				calls := len(seen)
+				mu.Unlock()
+				if calls == 1 {
+					writer.WriteHeader(tc.status)
+					_, _ = writer.Write([]byte(tc.body))
+					return
+				}
+				writer.WriteHeader(http.StatusOK)
+				_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+			}))
+			defer server.Close()
+
+			settings := config.Default()
+			settings.BaseURL = server.URL
+			settings.EndpointLayout = config.LayoutFamily
+			settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+			client := New(settings)
+
+			result, errExecute := client.Execute(t.Context(), Call{
+				Role:  roles.ByName("chat"),
+				Model: "deepseek-v4.1-flash",
+				Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"developer","content":"sys"}]}`),
+			})
+			if errExecute != nil {
+				t.Fatalf("Execute failed: %v", errExecute)
+			}
+			if result.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want 200", result.StatusCode)
+			}
+			if len(result.Repairs) != 1 || result.Repairs[0] != "developer-role" {
+				t.Errorf("repairs = %v, want [developer-role]", result.Repairs)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(seen) != 2 {
+				t.Fatalf("upstream calls = %d, want 2", len(seen))
+			}
+			if !strings.Contains(string(seen[1].Body), `"role":"system"`) || strings.Contains(string(seen[1].Body), `"role":"developer"`) {
+				t.Errorf("attempt 2 must rewrite developer to system: %s", seen[1].Body)
+			}
+		})
 	}
 }
 
