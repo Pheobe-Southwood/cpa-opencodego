@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/Pheobe-Southwood/cpa-opencodego/internal/abi"
 	"github.com/Pheobe-Southwood/cpa-opencodego/internal/config"
 	"github.com/Pheobe-Southwood/cpa-opencodego/internal/roles"
 )
@@ -434,6 +436,100 @@ func TestExecuteRetriesTransient400Once(t *testing.T) {
 				t.Errorf("transient retry must not rewrite the body: %s vs %s", seen[0].Body, seen[1].Body)
 			}
 		})
+	}
+}
+
+func TestExecuteRetriesEndpointUnavailable503Once(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = writer.Write([]byte(`{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	result, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4-pro",
+		Body:  []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute must retry the endpoint-unavailable 503: %v", errExecute)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", result.StatusCode)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2", got)
+	}
+}
+
+func TestExecuteEndpointUnavailableRetryIsBounded(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = writer.Write([]byte(`{"error":{"type":"server_error","message":"Upstream request failed: Endpoint is unavailable."}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	_, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4-pro",
+		Body:  []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute == nil {
+		t.Fatal("a persistent 503 must surface as an error")
+	}
+	if got := abi.Status(errExecute); got != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", got)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry only)", got)
+	}
+}
+
+func TestExecuteDoesNotRetryOther503(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = writer.Write([]byte(`{"error":{"type":"server_error","message":"upstream overloaded"}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	_, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4-pro",
+		Body:  []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute == nil {
+		t.Fatal("a generic 503 must surface as an error")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (no retry for an unclassified 503)", got)
 	}
 }
 

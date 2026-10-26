@@ -25,6 +25,11 @@ import (
 // maxErrorBody caps how much upstream error text is surfaced downstream.
 const maxErrorBody = 2048
 
+// endpointUnavailableRetryDelay spaces the single retry for a 503
+// "Endpoint is unavailable" response far enough apart that a new upstream
+// connection can land on a healthy gateway node.
+const endpointUnavailableRetryDelay = 300 * time.Millisecond
+
 // anthropicVersion is required by the Anthropic Messages endpoint.
 const anthropicVersion = "2023-06-01"
 
@@ -286,6 +291,7 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 	}
 
 	transientRetried := false
+	unavailableRetried := false
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			// A retry must not reuse the connection that just failed: the
@@ -302,6 +308,24 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		if errDo != nil {
 			return nil, appliedRepairs, abi.StatusErrorf(http.StatusBadGateway, "upstream_unreachable",
 				"连接 OpenCode Go 失败: %v", errDo)
+		}
+		// OpenCode Go answers a transient gateway/node problem with 503
+		// server_error "Endpoint is unavailable." CLIProxyAPI cools the whole
+		// credential on every transient 5xx, so trying the same key once more
+		// on a fresh connection is cheaper than a model-wide blackout. This is
+		// safe for streaming too: a 503 response never carried any content.
+		if response.StatusCode == http.StatusServiceUnavailable && !unavailableRetried && attempt < 2 {
+			peeked, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBody))
+			_ = response.Body.Close()
+			if requestScopedUpstreamRefusal(peeked) {
+				unavailableRetried = true
+				if errWait := waitRetry(ctx, endpointUnavailableRetryDelay); errWait != nil {
+					return nil, appliedRepairs, abi.StatusErrorf(http.StatusRequestTimeout, "request_cancelled",
+						"等待 OpenCode Go 重试时请求已结束: %v", errWait)
+				}
+				continue
+			}
+			response.Body = io.NopCloser(bytes.NewReader(peeked))
 		}
 		if !isRepairableRejection(response.StatusCode) || attempt == 2 || !call.Role.StripsStreamField() {
 			if response.StatusCode >= 200 && response.StatusCode < 300 {
@@ -369,6 +393,18 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 // left untouched so authentication, quota and routing errors still surface.
 func isRepairableRejection(status int) bool {
 	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
+}
+
+// waitRetry sleeps for d unless the caller's context ends first.
+func waitRetry(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // newUpstreamRequest builds one upstream HTTP request. It is called once per
