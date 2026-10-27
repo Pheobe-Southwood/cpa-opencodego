@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Pheobe-Southwood/cpa-opencodego/internal/abi"
 	"github.com/Pheobe-Southwood/cpa-opencodego/internal/config"
@@ -849,5 +850,188 @@ func TestExecuteKeepAndOffDoNotRetry(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("calls = %d, want 1 (no retry when developer-role=keep)", calls)
+	}
+}
+
+func TestAdmissionRefusalRetryDelay(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		delay time.Duration
+		ok    bool
+	}{
+		{
+			name:  "hint is honoured",
+			body:  `{"error":{"type":"server_error","message":"Upstream request failed: [ttft_admission_refused] the cell is at capacity; retry shortly (after 16 s)"}}`,
+			delay: 16 * time.Second,
+			ok:    true,
+		},
+		{
+			name:  "hint is capped",
+			body:  `{"error":{"type":"server_error","message":"Upstream request failed: [ttft_admission_refused] the cell is at capacity; retry shortly (after 500 s)"}}`,
+			delay: admissionRetryMaxDelay,
+			ok:    true,
+		},
+		{
+			name:  "missing hint falls back to the short delay",
+			body:  `{"error":{"type":"server_error","message":"[ttft_admission_refused] the cell is at capacity"}}`,
+			delay: endpointUnavailableRetryDelay,
+			ok:    true,
+		},
+		{
+			name: "quota failure is not an admission refusal",
+			body: `{"error":{"code":"GoUsageLimitError","message":"Go usage limit exceeded"}}`,
+		},
+		{
+			name: "opaque body is not an admission refusal",
+			body: `{"model":"deepseek-v4.1-flash"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			delay, ok := admissionRefusalRetryDelay([]byte(tc.body))
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v", ok, tc.ok)
+			}
+			if ok && delay != tc.delay {
+				t.Errorf("delay = %s, want %s", delay, tc.delay)
+			}
+		})
+	}
+}
+
+func TestExecuteRetriesAdmissionRefusalAfterHint(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			writer.WriteHeader(http.StatusTooManyRequests)
+			_, _ = writer.Write([]byte(`{"error":{"type":"server_error","message":"Upstream request failed: [ttft_admission_refused] the cell is at capacity; retry shortly (after 1 s)"}}`))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	started := time.Now()
+	result, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute must retry the admission refusal: %v", errExecute)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", result.StatusCode)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2", got)
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Errorf("retry happened after %s, want the 1s hint to be honoured", elapsed)
+	}
+}
+
+func TestExecuteAdmissionRetryIsBounded(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = writer.Write([]byte(`{"error":{"type":"server_error","message":"Upstream request failed: [ttft_admission_refused] the cell is at capacity; retry shortly (after 0 s)"}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	_, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute == nil {
+		t.Fatal("a persistent admission refusal must surface as an error")
+	}
+	if got := abi.Status(errExecute); got != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", got)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry only)", got)
+	}
+}
+
+func TestExecuteDoesNotRetryQuota429(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = writer.Write([]byte(`{"error":{"code":"GoUsageLimitError","message":"Go usage limit exceeded"}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	_, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute == nil {
+		t.Fatal("a quota 429 must surface as an error")
+	}
+	if got := abi.Status(errExecute); got != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (quota must not be retried)", got)
+	}
+}
+
+func TestExecuteRetriesOpaque429Once(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			writer.WriteHeader(http.StatusTooManyRequests)
+			_, _ = writer.Write([]byte(`{"model":"deepseek-v4.1-flash"}`))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	result, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute must retry the opaque 429: %v", errExecute)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", result.StatusCode)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2", got)
 	}
 }

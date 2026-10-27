@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +31,42 @@ const maxErrorBody = 2048
 // "Endpoint is unavailable" response far enough apart that a new upstream
 // connection can land on a healthy gateway node.
 const endpointUnavailableRetryDelay = 300 * time.Millisecond
+
+// admissionRetryMaxDelay bounds the single wait before retrying a transient
+// admission refusal. The upstream hint is a handful of seconds in practice;
+// the cap keeps a stale or hostile hint from parking a request for minutes.
+const admissionRetryMaxDelay = 30 * time.Second
+
+// admissionRefusalHint matches the retry hint OpenCode Go appends to an
+// admission refusal: "[ttft_admission_refused] the cell is at capacity; retry
+// shortly (after 16 s)".
+var admissionRefusalHint = regexp.MustCompile(`after\s+([0-9]{1,4})\s*s`)
+
+// admissionRefusalRetryDelay reports how long to wait before retrying a 429
+// that is an admission refusal rather than a verdict on the credential.
+//
+// The refusal means the gateway cell that would run this request is full, not
+// that the key ran out of quota, and the upstream says when to come back.
+// CLIProxyAPI cannot make that distinction: it cools the credential on every
+// 429, so two refusals across a two-key pool black out the model with "all
+// credentials are cooling down". Absorbing the refusal here keeps a capacity
+// blip from turning into a credential cooldown, which is strictly worse for
+// every following request on the same key.
+func admissionRefusalRetryDelay(body []byte) (time.Duration, bool) {
+	if !bytes.Contains(body, []byte("ttft_admission_refused")) {
+		return 0, false
+	}
+	delay := endpointUnavailableRetryDelay
+	if match := admissionRefusalHint.FindSubmatch(body); match != nil {
+		if seconds, errAtoi := strconv.Atoi(string(match[1])); errAtoi == nil && seconds > 0 {
+			delay = time.Duration(seconds) * time.Second
+		}
+	}
+	if delay > admissionRetryMaxDelay {
+		delay = admissionRetryMaxDelay
+	}
+	return delay, true
+}
 
 // anthropicVersion is required by the Anthropic Messages endpoint.
 const anthropicVersion = "2023-06-01"
@@ -292,6 +330,7 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 
 	transientRetried := false
 	unavailableRetried := false
+	admissionRetried := false
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			// A retry must not reuse the connection that just failed: the
@@ -320,6 +359,31 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 			if requestScopedUpstreamRefusal(peeked) {
 				unavailableRetried = true
 				if errWait := waitRetry(ctx, endpointUnavailableRetryDelay); errWait != nil {
+					return nil, appliedRepairs, abi.StatusErrorf(http.StatusRequestTimeout, "request_cancelled",
+						"等待 OpenCode Go 重试时请求已结束: %v", errWait)
+				}
+				continue
+			}
+			response.Body = io.NopCloser(bytes.NewReader(peeked))
+		}
+		// A 429 is not always a credential verdict. OpenCode Go answers a full
+		// gateway cell with "[ttft_admission_refused] the cell is at capacity"
+		// plus a retry hint, and it occasionally hides the same gateway hiccup
+		// behind an opaque 429 whose body is just {"model":"..."}. Neither is a
+		// quota failure, but CLIProxyAPI cools the key on every 429; retrying
+		// the same key once here keeps a capacity blip from escalating into a
+		// cooldown that outlives the blip. Quota and auth 429s are untouched:
+		// they must reach the host so it can cool the key and switch.
+		if response.StatusCode == http.StatusTooManyRequests && !admissionRetried && attempt < 2 {
+			peeked, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBody))
+			_ = response.Body.Close()
+			delay, admission := admissionRefusalRetryDelay(peeked)
+			if !admission && isTransientRejection(peeked) {
+				delay, admission = endpointUnavailableRetryDelay, true
+			}
+			if admission {
+				admissionRetried = true
+				if errWait := waitRetry(ctx, delay); errWait != nil {
 					return nil, appliedRepairs, abi.StatusErrorf(http.StatusRequestTimeout, "request_cancelled",
 						"等待 OpenCode Go 重试时请求已结束: %v", errWait)
 				}
