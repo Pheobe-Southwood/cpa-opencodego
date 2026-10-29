@@ -77,6 +77,111 @@ func TestNormalizeDeveloperRolesNoops(t *testing.T) {
 	}
 }
 
+func TestNormalizeTopPClampsOutOfRange(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"zero", `{"model":"deepseek-v4.1-flash","top_p":0,"stream":true}`},
+		{"zero_float", `{"model":"deepseek-v4.1-flash","top_p":0.0}`},
+		{"negative", `{"top_p":-0.5}`},
+		{"above_one", `{"top_p":1.5}`},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			out, changed := normalizeTopP(roles.ByName("chat"), []byte(test.body))
+			if !changed {
+				t.Fatalf("out-of-range top_p must be rewritten: %s", test.body)
+			}
+			decoded := decodeBody(t, out)
+			if decoded["top_p"] != float64(1) {
+				t.Errorf("top_p = %v, want 1", decoded["top_p"])
+			}
+			// Only top_p may change: the model and stream flags stay as sent.
+			if test.name == "zero" && (decoded["model"] != "deepseek-v4.1-flash" || decoded["stream"] != true) {
+				t.Errorf("unrelated fields changed: %s", out)
+			}
+		})
+	}
+}
+
+func TestNormalizeTopPLeavesValidBodies(t *testing.T) {
+	// A valid value, an absent field, null, a non-numeric value and non-JSON
+	// bodies are all returned byte-for-byte.
+	for _, body := range []string{
+		`{"model":"m","top_p":0.7}`,
+		`{"model":"m","top_p":1}`,
+		`{"model":"m"}`,
+		`{"model":"m","top_p":null}`,
+		`{"model":"m","top_p":"0.7"}`,
+		`{"model":"m","top_p":true}`,
+		`not json`,
+	} {
+		out, changed := normalizeTopP(roles.ByName("chat"), []byte(body))
+		if changed || string(out) != body {
+			t.Errorf("body must pass through unchanged: %q -> %q (changed=%v)", body, out, changed)
+		}
+	}
+	// The Anthropic transcript uses a different schema even though it also has
+	// a top_p field; leave it to the Messages face.
+	body := `{"top_p":0}`
+	if out, changed := normalizeTopP(roles.ByName("messages"), []byte(body)); changed || string(out) != body {
+		t.Errorf("the messages family must not be rewritten: %s", out)
+	}
+	// Responses bodies are OpenAI-shaped and must be repaired as well.
+	out, changed := normalizeTopP(roles.ByName("responses"), []byte(`{"input":"hi","top_p":0}`))
+	if !changed || decodeBody(t, out)["top_p"] != float64(1) {
+		t.Errorf("responses top_p=0 must be clamped: %s (changed=%v)", out, changed)
+	}
+}
+
+// A preemptive clamp must reach the upstream on the first attempt and surface
+// the repair on the result, without an extra round trip.
+func TestExecuteNormalizesTopPBeforeSending(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen []capturedRequest
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, _ := io.ReadAll(request.Body)
+		mu.Lock()
+		seen = append(seen, capturedRequest{Path: request.URL.Path, Body: raw})
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	result, err := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","top_p":0,"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", result.StatusCode)
+	}
+	if len(result.Repairs) != 1 || result.Repairs[0] != "top-p-range" {
+		t.Errorf("repairs = %v, want [top-p-range]", result.Repairs)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 1 {
+		t.Fatalf("upstream calls = %d, want 1", len(seen))
+	}
+	if got := decodeBody(t, seen[0].Body)["top_p"]; got != float64(1) {
+		t.Errorf("upstream top_p = %v, want 1 (body: %s)", got, seen[0].Body)
+	}
+}
+
 type capturedRequest struct {
 	Path    string
 	Headers http.Header

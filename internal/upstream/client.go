@@ -311,6 +311,10 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		if devMode == config.DeveloperRoleRewrite {
 			body = normalizeDeveloperRoles(call.Role, body, true)
 		}
+		if next, changed := normalizeTopP(call.Role, body); changed {
+			body = next
+			appliedRepairs = append(appliedRepairs, "top-p-range")
+		}
 		if replayMode == config.ReasoningReplayAlways || replayMode == config.ReasoningReplayAuto || (replayMode == config.ReasoningReplayRetryOnly && stickyReasoning) {
 			mode := replayMode
 			if mode == config.ReasoningReplayRetryOnly {

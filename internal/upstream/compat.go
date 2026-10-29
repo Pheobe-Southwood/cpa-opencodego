@@ -296,6 +296,50 @@ func rawEnablesThinking(raw json.RawMessage) bool {
 	return false
 }
 
+// normalizeTopP clamps a top_p value the gateway's gRPC frontend refuses.
+//
+// The OpenAI schema allows top_p anywhere in [0,1], and some clients spell
+// "nucleus sampling off" as 0. The permissive gateway nodes ignore that value,
+// but the gRPC frontend validates the range as (0,1] and answers HTTP 400:
+//
+//	[invalid_request_error] Invalid top_p value, the valid range of top_p is (0, 1.0]
+//
+// Because the node is chosen per attempt, the same client alternates between
+// 200 and 400. Mapping 0 (and any negative or above-1 value) to 1.0 matches
+// what the permissive nodes already do for 0: it disables nucleus sampling
+// instead of narrowing it, so the accepted path keeps its current behaviour.
+// Valid values and every other field are preserved; a body without the field
+// is returned byte-for-byte.
+func normalizeTopP(role roles.Role, body []byte) ([]byte, bool) {
+	if role.Name != roles.Chat && role.Name != roles.Responses {
+		return body, false
+	}
+	if !bytes.Contains(body, []byte(`"top_p"`)) {
+		return body, false
+	}
+	var object map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &object); errUnmarshal != nil {
+		return body, false
+	}
+	raw, ok := object["top_p"]
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return body, false
+	}
+	var value float64
+	if errDecode := json.Unmarshal(raw, &value); errDecode != nil {
+		return body, false
+	}
+	if value > 0 && value <= 1 {
+		return body, false
+	}
+	object["top_p"] = json.RawMessage("1")
+	out, errMarshal := json.Marshal(object)
+	if errMarshal != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // isDeveloperRoleRejection reports whether an upstream rejection is caused by
 // the gateway not accepting the Chat Completions "developer" role.
 //
