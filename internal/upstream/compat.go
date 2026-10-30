@@ -406,3 +406,83 @@ func isReasoningReplayRejection(body []byte) bool {
 	}
 	return bytes.Contains(body, []byte("reasoning_content")) || bytes.Contains(body, []byte("reasoning_text"))
 }
+
+// thinkingDisableFields are the top-level Chat Completions switches a client can
+// use to ask for reasoning to be turned off. Different client families spell the
+// switch differently, so the repair drops whichever one is present.
+var thinkingDisableFields = []string{
+	"reasoning_effort",
+	"reasoning",
+	"thinking",
+	"enable_thinking",
+	"reasoning_enabled",
+}
+
+// isThinkingDisableRejection reports whether an upstream 400 refuses a request
+// because it asked a thinking-only model to stop reasoning.
+//
+// Some OpenCode Go model ids are thinking-only: GLM-5.3 always reasons, and the
+// gateway answers any request that disables thinking with HTTP 400:
+//
+//	[400] GLM-5.3 is a thinking-only model; disabling thinking (reasoning_effort='none') is not supported.
+//
+// reasoning_effort is part of the OpenAI Chat Completions schema, so the client
+// request is legal; the rejection is a model capability mismatch, not a quota,
+// auth or content verdict. The caller repairs the body and retries once instead
+// of surfacing a failure.
+func isThinkingDisableRejection(body []byte) bool {
+	lower := bytes.ToLower(body)
+	if !bytes.Contains(lower, []byte("thinking-only")) {
+		return false
+	}
+	for _, marker := range []string{
+		"disabling thinking",
+		"disable thinking",
+		"disabling reasoning",
+		"disable reasoning",
+	} {
+		if bytes.Contains(lower, []byte(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeThinkingDisable drops top-level switches that ask a model to stop
+// reasoning. It is the repair for isThinkingDisableRejection: a thinking-only
+// model cannot honour them, and the gateway rejects the whole request when they
+// are present. Removing them lets the model run in its only supported mode
+// (thinking on) instead of failing the request.
+//
+// Switches that enable or tune reasoning are left untouched, as is every other
+// field. A body without a disable switch, or a body that is not a JSON object,
+// is returned byte-for-byte.
+func normalizeThinkingDisable(role roles.Role, body []byte) ([]byte, bool) {
+	if role.Name != roles.Chat && role.Name != roles.Responses {
+		return body, false
+	}
+	var object map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &object); errUnmarshal != nil {
+		return body, false
+	}
+	changed := false
+	for _, field := range thinkingDisableFields {
+		raw, ok := object[field]
+		if !ok {
+			continue
+		}
+		if rawEnablesThinking(raw) {
+			continue
+		}
+		delete(object, field)
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	out, errMarshal := json.Marshal(object)
+	if errMarshal != nil {
+		return body, false
+	}
+	return out, true
+}

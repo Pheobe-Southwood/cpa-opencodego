@@ -435,7 +435,18 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 			repaired = true
 		}
 
-		// 3. A bare or "feature unavailable" 400 is a gateway glitch; retry the
+		// 3. A thinking-only model rejects any request that asks it to stop
+		// reasoning. reasoning_effort is a legal Chat Completions field, so drop
+		// the disable switch and let the model run in its only supported mode.
+		if !repaired && !containsString(appliedRepairs, "thinking-disable") && isThinkingDisableRejection(peeked) {
+			if next, changed := normalizeThinkingDisable(call.Role, body); changed {
+				body = next
+				appliedRepairs = append(appliedRepairs, "thinking-disable")
+				repaired = true
+			}
+		}
+
+		// 4. A bare or "feature unavailable" 400 is a gateway glitch; retry the
 		// unchanged body once before surfacing it to the client.
 		if !repaired && !transientRetried && isTransientRejection(peeked) {
 			transientRetried = true

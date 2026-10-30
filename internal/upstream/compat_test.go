@@ -1140,3 +1140,176 @@ func TestExecuteRetriesOpaque429Once(t *testing.T) {
 		t.Errorf("upstream calls = %d, want 2", got)
 	}
 }
+
+func TestIsThinkingDisableRejection(t *testing.T) {
+	cases := []struct {
+		body []byte
+		want bool
+	}{
+		{[]byte(`{"error":{"message":"invalid_request_error: Upstream request failed: [400] GLM-5.3 is a thinking-only model; disabling thinking (reasoning_effort='none') is not supported."}}`), true},
+		{[]byte(`GLM-5.3 is a thinking-only model and does not support disabling thinking`), true},
+		{[]byte(`{"error":{"message":"thinking-only model cannot disable reasoning"}}`), true},
+		{[]byte(`{"error":{"message":"invalid_request_error: Invalid top_p value, the valid range of top_p is (0, 1.0]"}}`), false},
+		{[]byte(`{"error":{"message":"chat message role developer is not supported"}}`), false},
+		{[]byte(`{"error":{"message":"The reasoning_content in the thinking mode must be passed back"}}`), false},
+		{[]byte(`{"error":{"message":"model not found"}}`), false},
+	}
+	for _, tc := range cases {
+		if got := isThinkingDisableRejection(tc.body); got != tc.want {
+			t.Errorf("isThinkingDisableRejection(%s) = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeThinkingDisableDropsOnlyDisableSwitches(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want map[string]bool // field -> must still be present
+	}{
+		{
+			name: "reasoning_effort_none",
+			body: `{"model":"glm-5.3","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]bool{"model": true, "messages": true},
+		},
+		{
+			name: "nested_thinking_disabled",
+			body: `{"model":"glm-5.3","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]bool{"model": true, "messages": true},
+		},
+		{
+			name: "enable_thinking_false",
+			body: `{"model":"glm-5.3","enable_thinking":false,"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]bool{"model": true, "messages": true},
+		},
+		{
+			name: "reasoning_object_effort_none",
+			body: `{"model":"glm-5.3","reasoning":{"effort":"none"},"messages":[{"role":"user","content":"hi"}]}`,
+			want: map[string]bool{"model": true, "messages": true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, changed := normalizeThinkingDisable(roles.ByName("chat"), []byte(tc.body))
+			if !changed {
+				t.Fatalf("a disable switch must be dropped: %s", tc.body)
+			}
+			decoded := decodeBody(t, out)
+			for field := range tc.want {
+				if _, ok := decoded[field]; !ok {
+					t.Errorf("field %q must be preserved: %s", field, out)
+				}
+			}
+			for _, field := range thinkingDisableFields {
+				if _, ok := decoded[field]; ok {
+					t.Errorf("disable field %q must be dropped: %s", field, out)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizeThinkingDisableKeepsEnabledValuesAndNoops(t *testing.T) {
+	cases := []string{
+		`{"model":"glm-5.3","reasoning_effort":"high","messages":[]}`,
+		`{"model":"glm-5.3","thinking":{"type":"enabled"},"messages":[]}`,
+		`{"model":"glm-5.3","enable_thinking":true,"messages":[]}`,
+		`{"model":"glm-5.3","messages":[]}`,
+		`not json`,
+	}
+	for _, body := range cases {
+		if out, changed := normalizeThinkingDisable(roles.ByName("chat"), []byte(body)); changed {
+			t.Errorf("body must not be rewritten: %s -> %s", body, out)
+		}
+	}
+	// Only the OpenAI-shaped faces carry these switches.
+	if _, changed := normalizeThinkingDisable(roles.ByName("messages"), []byte(`{"model":"m","reasoning_effort":"none"}`)); changed {
+		t.Error("the messages face must not be rewritten")
+	}
+}
+
+func TestExecuteRetriesThinkingOnlyRejection(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen []capturedRequest
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, _ := io.ReadAll(request.Body)
+		mu.Lock()
+		seen = append(seen, capturedRequest{Path: request.URL.Path, Body: raw})
+		calls := len(seen)
+		mu.Unlock()
+		if calls == 1 {
+			writer.WriteHeader(http.StatusBadRequest)
+			_, _ = writer.Write([]byte(`{"error":{"message":"invalid_request_error: Upstream request failed: [400] GLM-5.3 is a thinking-only model; disabling thinking (reasoning_effort='none') is not supported."}}`))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	result, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "glm-5.3",
+		Body:  []byte(`{"model":"glm-5.3","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute must repair the thinking-only rejection: %v", errExecute)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", result.StatusCode)
+	}
+	if len(result.Repairs) != 1 || result.Repairs[0] != "thinking-disable" {
+		t.Errorf("repairs = %v, want [thinking-disable]", result.Repairs)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("upstream calls = %d, want 2", len(seen))
+	}
+	if decoded := decodeBody(t, seen[0].Body); decoded["reasoning_effort"] != "none" {
+		t.Errorf("attempt 1 must preserve the client body: %s", seen[0].Body)
+	}
+	decoded := decodeBody(t, seen[1].Body)
+	if _, ok := decoded["reasoning_effort"]; ok {
+		t.Errorf("attempt 2 must drop reasoning_effort: %s", seen[1].Body)
+	}
+	if decoded["model"] != "glm-5.3" {
+		t.Errorf("attempt 2 must preserve the model: %s", seen[1].Body)
+	}
+}
+
+func TestExecuteThinkingDisableRetryIsBounded(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = writer.Write([]byte(`{"error":{"message":"invalid_request_error: Upstream request failed: [400] GLM-5.3 is a thinking-only model; disabling thinking (reasoning_effort='none') is not supported."}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	if _, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "glm-5.3",
+		Body:  []byte(`{"model":"glm-5.3","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}`),
+	}); errExecute == nil {
+		t.Fatal("a still-rejected request must surface the upstream error")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one repair attempt only)", got)
+	}
+}
