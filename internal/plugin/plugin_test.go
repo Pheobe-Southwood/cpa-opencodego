@@ -92,24 +92,35 @@ func TestForwardHeadersDropsHopByHop(t *testing.T) {
 	}
 }
 
-func TestClaimsRespectsFamilyAndToggle(t *testing.T) {
-	runtime := New(rolesChat())
-	settings := config.Default()
-	settings.Models = map[string]config.ModelSetting{
-		"grok-4.7": {Family: "chat"},
-	}
-	disabled := false
-	settings.Models["deepseek-v4-pro"] = config.ModelSetting{Enabled: &disabled}
-	runtime.applySettings(settings)
-
-	if !runtime.claims("grok-4.7") {
-		t.Error("an explicit family override must let the chat build claim the model")
-	}
-	if runtime.claims("deepseek-v4-pro") {
-		t.Error("a disabled model must not be claimed")
-	}
-	if runtime.claims("gpt-6-luna") {
-		t.Error("a responses-family model must not be claimed by the chat build")
+// The model router must never force this provider ahead of the host's own
+// model-to-provider arbitration. A native channel for the same model id is how
+// the operator adds a fallback; a forced route then reaches a provider whose
+// executor the host did not register, and fails with auth_not_found even though
+// the keys have quota.
+func TestModelRouterDeclinesHostArbitratedModels(t *testing.T) {
+	for _, role := range roles.All {
+		runtime := New(role)
+		runtime.applySettings(config.Default())
+		request, errMarshal := json.Marshal(pluginapi.ModelRouteRequest{RequestedModel: "gemini-4-argon"})
+		if errMarshal != nil {
+			t.Fatalf("marshal route request: %v", errMarshal)
+		}
+		var envelope struct {
+			OK     bool               `json:"ok"`
+			Result modelRouteResponse `json:"result"`
+		}
+		if errUnmarshal := json.Unmarshal(runtime.handleModelRoute(request), &envelope); errUnmarshal != nil {
+			t.Fatalf("decode route response: %v", errUnmarshal)
+		}
+		if !envelope.OK {
+			t.Fatalf("role %s route returned an error", role.Name)
+		}
+		if envelope.Result.Handled {
+			t.Fatalf("role %s claimed a model the host may arbitrate: %+v", role.Name, envelope.Result)
+		}
+		if envelope.Result.Target != "" || envelope.Result.TargetModel != "" {
+			t.Fatalf("role %s must not target a provider when declining: %+v", role.Name, envelope.Result)
+		}
 	}
 }
 
@@ -135,8 +146,14 @@ func TestRegistrationDeclaresSingleFormat(t *testing.T) {
 	if decoded.SchemaVersion != 6 {
 		t.Errorf("schema_version = %d, want 6", decoded.SchemaVersion)
 	}
-	if !decoded.Capabilities.Executor || !decoded.Capabilities.ModelProvider || !decoded.Capabilities.ModelRouter {
+	if !decoded.Capabilities.Executor || !decoded.Capabilities.ModelProvider {
 		t.Errorf("missing capabilities: %+v", decoded.Capabilities)
+	}
+	// The host picks the provider for a model id. Advertising model_router would
+	// let this plugin override that choice and dead-end the request whenever a
+	// native channel also serves the same id.
+	if decoded.Capabilities.ModelRouter {
+		t.Error("the plugin must not advertise model_router")
 	}
 	if !decoded.Capabilities.ManagementAPI {
 		t.Error("the chat build owns the dashboard and must declare management_api")
@@ -489,49 +506,6 @@ func TestStatePayloadCarriesPlan(t *testing.T) {
 	runtime.applySettings(settings)
 	if got := runtime.StatePayload().Plan; got != "go-plus" {
 		t.Errorf("state plan = %q", got)
-	}
-}
-
-// The model route must hand execution to CPA's AuthManager instead of running
-// the upstream call from the plugin. TargetKind "self" was the v1.10-v2.0.2
-// regression that bypassed key selection, rotation, cooldown and failover.
-func TestModelRouteTargetsCPAProvider(t *testing.T) {
-	for _, role := range roles.All {
-		runtime := New(role)
-		runtime.applySettings(config.Default())
-
-		models := runtime.models()
-		if len(models) == 0 {
-			t.Fatalf("role %s has no enabled model to route", role.Name)
-		}
-		request, errMarshal := json.Marshal(pluginapi.ModelRouteRequest{RequestedModel: models[0].ID})
-		if errMarshal != nil {
-			t.Fatalf("marshal route request: %v", errMarshal)
-		}
-		var envelope struct {
-			OK     bool               `json:"ok"`
-			Result modelRouteResponse `json:"result"`
-		}
-		if errUnmarshal := json.Unmarshal(runtime.handleModelRoute(request), &envelope); errUnmarshal != nil {
-			t.Fatalf("decode route response: %v", errUnmarshal)
-		}
-		if !envelope.OK {
-			t.Fatalf("role %s route returned an error", role.Name)
-		}
-		if !envelope.Result.Handled {
-			t.Fatalf("role %s did not claim %q", role.Name, models[0].ID)
-		}
-		if envelope.Result.TargetKind != "provider" {
-			t.Fatalf("role %s TargetKind = %q, want provider", role.Name, envelope.Result.TargetKind)
-		}
-		if envelope.Result.Target != role.Provider {
-			t.Fatalf("role %s Target = %q, want %q", role.Name, envelope.Result.Target, role.Provider)
-		}
-		// The plugin keeps owning model mapping, so the host must pass the
-		// catalogue model through unchanged.
-		if envelope.Result.TargetModel != "" {
-			t.Fatalf("role %s set TargetModel = %q; the plugin maps the model itself", role.Name, envelope.Result.TargetModel)
-		}
 	}
 }
 

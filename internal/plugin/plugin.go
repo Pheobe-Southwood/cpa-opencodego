@@ -288,7 +288,6 @@ func (r *Runtime) registrationPayload() []byte {
 	}
 	capabilities := registrationCapabilities{
 		ModelProvider:         true,
-		ModelRouter:           true,
 		Executor:              true,
 		ExecutorModelScope:    string(pluginapi.ExecutorModelScopeBoth),
 		ExecutorInputFormats:  r.role.Formats,
@@ -464,41 +463,35 @@ func (r *Runtime) handleStaticModels(request []byte) []byte {
 	return raw
 }
 
+// handleModelRoute declines every model on purpose.
+//
+// The router used to claim this build's enabled catalogue so the host would
+// force the request through the plugin provider. That decision outweighs the
+// host's own arbitration, which prefers a native executor when another provider
+// also serves the same model id: once the operator configures a native
+// fallback channel for an OpenCode Go model (for example a paid channel for
+// gemini-4-argon), the host skips this provider's executor at registration and
+// a forced route dies with
+//
+//	auth_not_found: no auth available (providers=opencode-go-gemini, model=gemini-4-argon)
+//
+// even though the keys have quota and the request is valid. Declining the route
+// lets the host registry decide: models only this provider serves still resolve
+// to it (the plugin registers both the model and its executor), while models the
+// host serves natively fall back to the native executor instead of failing.
 func (r *Runtime) handleModelRoute(request []byte) []byte {
 	r.refreshShared()
-	var routeRequest pluginapi.ModelRouteRequest
 	if len(request) > 0 {
+		var routeRequest pluginapi.ModelRouteRequest
 		if errUnmarshal := json.Unmarshal(request, &routeRequest); errUnmarshal != nil {
 			return abi.Fail("invalid_request", errUnmarshal.Error(), http.StatusBadRequest)
 		}
 	}
-	requested := strings.TrimSpace(routeRequest.RequestedModel)
-	if requested == "" || !r.claims(requested) {
-		raw, errMarshal := abi.OK(modelRouteResponse{Handled: false})
-		if errMarshal != nil {
-			return abi.Fail("marshal_error", errMarshal.Error(), http.StatusInternalServerError)
-		}
-		return raw
-	}
-	raw, errMarshal := abi.OK(modelRouteResponse{
-		Handled:    true,
-		TargetKind: "provider",
-		Target:     r.role.Provider,
-		Reason:     "opencode-go/" + string(r.role.Name),
-	})
+	raw, errMarshal := abi.OK(modelRouteResponse{Handled: false})
 	if errMarshal != nil {
 		return abi.Fail("marshal_error", errMarshal.Error(), http.StatusInternalServerError)
 	}
 	return raw
-}
-
-// claims reports whether this provider owns the requested model id.
-func (r *Runtime) claims(model string) bool {
-	entry, ok := r.Resolver().Resolve(model)
-	if !ok || !entry.Enabled {
-		return false
-	}
-	return entry.Family == r.role.Name
 }
 
 func okJSON(v any) []byte {
