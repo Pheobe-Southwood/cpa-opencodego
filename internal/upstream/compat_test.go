@@ -77,6 +77,106 @@ func TestNormalizeDeveloperRolesNoops(t *testing.T) {
 	}
 }
 
+func TestNormalizeGeminiRolesFillsMissingRole(t *testing.T) {
+	// A GenAI Content may omit the optional role; the official schema treats
+	// that as the "user" turn, but the OpenCode Go frontend rejects it.
+	body := []byte(`{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}`)
+	out, changed := normalizeGeminiRoles(roles.ByName("gemini"), body)
+	if !changed {
+		t.Fatal("a contents entry without a role must be repaired")
+	}
+	decoded := decodeBody(t, out)
+	contents := decoded["contents"].([]any)
+	first := contents[0].(map[string]any)
+	if first["role"] != "user" {
+		t.Errorf("missing role = %v, want user", first["role"])
+	}
+	parts := first["parts"].([]any)
+	if parts[0].(map[string]any)["text"] != "hi" {
+		t.Errorf("parts were not preserved: %s", out)
+	}
+	config := decoded["generationConfig"].(map[string]any)
+	if config["maxOutputTokens"] != float64(16) {
+		t.Errorf("generationConfig was not preserved: %s", out)
+	}
+}
+
+func TestNormalizeGeminiRolesMapsAssistantAndEmpty(t *testing.T) {
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"assistant","parts":[{"text":"hello"}]},{"role":"","parts":[{"text":"again"}]}]}`)
+	out, changed := normalizeGeminiRoles(roles.ByName("gemini"), body)
+	if !changed {
+		t.Fatal("assistant and empty roles must be repaired")
+	}
+	decoded := decodeBody(t, out)
+	contents := decoded["contents"].([]any)
+	want := []string{"user", "model", "user"}
+	for index, expected := range want {
+		if got := contents[index].(map[string]any)["role"]; got != expected {
+			t.Errorf("contents[%d].role = %v, want %s", index, got, expected)
+		}
+	}
+}
+
+func TestNormalizeGeminiRolesNoops(t *testing.T) {
+	// Valid GenAI bodies, bodies without contents, non-GenAI faces and
+	// malformed payloads are returned byte-for-byte.
+	valid := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"ok"}]}]}`)
+	if got, changed := normalizeGeminiRoles(roles.ByName("gemini"), valid); changed || string(got) != string(valid) {
+		t.Errorf("valid roles must pass through byte-for-byte: %s", got)
+	}
+	noContents := []byte(`{"systemInstruction":{"parts":[{"text":"sys"}]}}`)
+	if got, changed := normalizeGeminiRoles(roles.ByName("gemini"), noContents); changed || string(got) != string(noContents) {
+		t.Errorf("a body without contents must pass through: %s", got)
+	}
+	chatBody := []byte(`{"messages":[{"content":"hi"}]}`)
+	if got, changed := normalizeGeminiRoles(roles.ByName("chat"), chatBody); changed || string(got) != string(chatBody) {
+		t.Errorf("non-GenAI faces must not be rewritten: %s", got)
+	}
+	broken := []byte(`{"contents":[{"parts":[{"text":"hi"}`)
+	if got, changed := normalizeGeminiRoles(roles.ByName("gemini"), broken); changed || string(got) != string(broken) {
+		t.Errorf("invalid JSON must pass through unchanged")
+	}
+	// A role the GenAI schema does not define is a client error, not a
+	// spelling the plugin may silently reinterpret.
+	unknown := []byte(`{"contents":[{"role":"system","parts":[{"text":"hi"}]}]}`)
+	if got, changed := normalizeGeminiRoles(roles.ByName("gemini"), unknown); changed || string(got) != string(unknown) {
+		t.Errorf("an unknown role must not be rewritten: %s", got)
+	}
+}
+
+func TestExecuteFillsGeminiRoleBeforeSending(t *testing.T) {
+	var seen atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, _ := io.ReadAll(request.Body)
+		seen.Store(string(raw))
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURLs = map[string]string{"gemini": server.URL}
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	if _, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("gemini"),
+		Model: "gemini-4-argon",
+		Body:  []byte(`{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}`),
+	}); errExecute != nil {
+		t.Fatalf("a schema-valid GenAI request must not fail: %v", errExecute)
+	}
+	raw, _ := seen.Load().(string)
+	if raw == "" {
+		t.Fatal("no upstream request was recorded")
+	}
+	decoded := decodeBody(t, []byte(raw))
+	contents := decoded["contents"].([]any)
+	if got := contents[0].(map[string]any)["role"]; got != "user" {
+		t.Errorf("upstream body role = %v, want user (%s)", got, raw)
+	}
+}
+
 func TestNormalizeTopPClampsOutOfRange(t *testing.T) {
 	cases := []struct {
 		name string

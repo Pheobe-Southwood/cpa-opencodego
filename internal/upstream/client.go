@@ -307,6 +307,15 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 	body := call.Body
 	var appliedRepairs []string
 
+	// The GenAI face is a byte pump, but the gateway's protobuf frontend
+	// rejects a legal Content that omits the schema-optional role. Fill the
+	// role before the first attempt so a valid request is not failed by an
+	// upstream deserialization detail.
+	if next, changed := normalizeGeminiRoles(call.Role, body); changed {
+		body = next
+		appliedRepairs = append(appliedRepairs, "gemini-role")
+	}
+
 	if call.Role.StripsStreamField() {
 		if devMode == config.DeveloperRoleRewrite {
 			body = normalizeDeveloperRoles(call.Role, body, true)

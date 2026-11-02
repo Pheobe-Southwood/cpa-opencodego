@@ -340,6 +340,96 @@ func normalizeTopP(role roles.Role, body []byte) ([]byte, bool) {
 	return out, true
 }
 
+// normalizeGeminiRoles gives every GenAI "contents" entry a role that the
+// OpenCode Go Gemini frontend accepts.
+//
+// Google's GenAI schema makes Content.role optional: an omitted role means
+// "user" (the official examples send the first user turn without a role). The
+// OpenCode Go frontend instead decodes Content into a protobuf message whose
+// role enum has no zero value it accepts, and answers HTTP 400 for a Content
+// whose role is unset:
+//
+//	[400] Please use a valid role: user, model.
+//
+// The plugin is a byte pump for the GenAI face, so the repair belongs here:
+// an omitted or empty role becomes "user" (the schema default), and the OpenAI
+// spelling "assistant" becomes "model". The two legal GenAI roles and every
+// other field are preserved byte-for-byte; a body without contents, a body that
+// is not JSON, or a non-Gemini face is returned untouched.
+func normalizeGeminiRoles(role roles.Role, body []byte) ([]byte, bool) {
+	if role.Name != roles.Gemini {
+		return body, false
+	}
+	if !bytes.Contains(body, []byte(`"contents"`)) {
+		return body, false
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return body, false
+	}
+	var object map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(trimmed, &object); errUnmarshal != nil {
+		return body, false
+	}
+	rawContents, ok := object["contents"]
+	if !ok {
+		return body, false
+	}
+	var items []json.RawMessage
+	if errUnmarshal := json.Unmarshal(bytes.TrimSpace(rawContents), &items); errUnmarshal != nil {
+		return body, false
+	}
+	changed := false
+	for index, item := range items {
+		var entry map[string]json.RawMessage
+		if errUnmarshal := json.Unmarshal(item, &entry); errUnmarshal != nil {
+			continue
+		}
+		wanted := ""
+		value, hasRole := entry["role"]
+		if !hasRole {
+			wanted = "user"
+		} else {
+			var roleName string
+			if errUnmarshal := json.Unmarshal(value, &roleName); errUnmarshal != nil {
+				continue
+			}
+			switch roleName {
+			case "user", "model":
+				continue
+			case "assistant":
+				wanted = "model"
+			case "":
+				wanted = "user"
+			default:
+				// Any other spelling is a client error; do not silently
+				// reinterpret a role the GenAI schema does not define.
+				continue
+			}
+		}
+		entry["role"] = json.RawMessage(`"` + wanted + `"`)
+		encoded, errMarshal := json.Marshal(entry)
+		if errMarshal != nil {
+			continue
+		}
+		items[index] = encoded
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	encodedItems, errMarshal := json.Marshal(items)
+	if errMarshal != nil {
+		return body, false
+	}
+	object["contents"] = encodedItems
+	out, errMarshal := json.Marshal(object)
+	if errMarshal != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // isDeveloperRoleRejection reports whether an upstream rejection is caused by
 // the gateway not accepting the Chat Completions "developer" role.
 //
