@@ -315,6 +315,15 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		body = next
 		appliedRepairs = append(appliedRepairs, "gemini-role")
 	}
+	// The GenAI frontend refuses a body whose last Content is a model turn, but
+	// assistant prefill is legal downstream and CLIProxyAPI strips only one
+	// trailing model turn when it translates. Close the gap before the first
+	// attempt so a valid prefill conversation does not fail with
+	// "[400] Requests ending with a model turn are not supported."
+	if next, changed := normalizeGeminiTrailingUserTurn(call.Role, body); changed {
+		body = next
+		appliedRepairs = append(appliedRepairs, "gemini-trailing-user")
+	}
 
 	if call.Role.StripsStreamField() {
 		if devMode == config.DeveloperRoleRewrite {
@@ -369,7 +378,7 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		if response.StatusCode == http.StatusServiceUnavailable && !unavailableRetried && attempt < 2 {
 			peeked, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBody))
 			_ = response.Body.Close()
-			if requestScopedUpstreamRefusal(peeked) {
+			if requestScopedUpstreamRefusal(peeked) || endpointUnavailableRejection(peeked) {
 				unavailableRetried = true
 				if errWait := waitRetry(ctx, endpointUnavailableRetryDelay); errWait != nil {
 					return nil, appliedRepairs, abi.StatusErrorf(http.StatusRequestTimeout, "request_cancelled",
@@ -382,16 +391,17 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 		// A 429 is not always a credential verdict. OpenCode Go answers a full
 		// gateway cell with "[ttft_admission_refused] the cell is at capacity"
 		// plus a retry hint, and it occasionally hides the same gateway hiccup
-		// behind an opaque 429 whose body is just {"model":"..."}. Neither is a
-		// quota failure, but CLIProxyAPI cools the key on every 429; retrying
-		// the same key once here keeps a capacity blip from escalating into a
-		// cooldown that outlives the blip. Quota and auth 429s are untouched:
-		// they must reach the host so it can cool the key and switch.
+		// behind an opaque 429 whose body is just {"model":"..."} or behind a
+		// 429 whose body is the "Endpoint is unavailable" server error. None of
+		// them is a quota failure, but CLIProxyAPI cools the key on every 429;
+		// retrying the same key once here keeps a capacity blip from escalating
+		// into a cooldown that outlives the blip. Quota and auth 429s are
+		// untouched: they must reach the host so it can cool the key and switch.
 		if response.StatusCode == http.StatusTooManyRequests && !admissionRetried && attempt < 2 {
 			peeked, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBody))
 			_ = response.Body.Close()
 			delay, admission := admissionRefusalRetryDelay(peeked)
-			if !admission && isTransientRejection(peeked) {
+			if !admission && (isTransientRejection(peeked) || endpointUnavailableRejection(peeked)) {
 				delay, admission = endpointUnavailableRetryDelay, true
 			}
 			if admission {
@@ -637,6 +647,19 @@ func requestScopedUpstreamRefusal(body []byte) bool {
 		return false
 	}
 	return strings.Contains(envelope.Error.Message, "Endpoint is unavailable")
+}
+
+// endpointUnavailableRejection reports whether an upstream body is the
+// "Endpoint is unavailable" gateway hiccup, regardless of which error type or
+// status the node chose for it.
+//
+// The retry decision only needs the message: a real quota refusal says the Go
+// usage limit was exceeded, and an auth failure says the credential is invalid,
+// so a body carrying this text is always a routing/capacity blip. Matching the
+// text instead of the full server_error envelope also covers nodes that omit
+// the error type (the first observed 429 of this shape had no type at all).
+func endpointUnavailableRejection(body []byte) bool {
+	return bytes.Contains(bytes.ToLower(body), []byte("endpoint is unavailable"))
 }
 
 // summarizeUpstreamError extracts the human-readable message from an upstream

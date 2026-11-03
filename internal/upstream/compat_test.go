@@ -177,6 +177,138 @@ func TestExecuteFillsGeminiRoleBeforeSending(t *testing.T) {
 	}
 }
 
+func TestNormalizeGeminiTrailingUserTurnAppendsCue(t *testing.T) {
+	cases := map[string]string{
+		"model_turn":     `{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"once upon"}]}],"generationConfig":{"maxOutputTokens":16}}`,
+		"assistant_turn": `{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"assistant","parts":[{"text":"once upon"}]}]}`,
+		"empty_model":    `{"contents":[{"role":"model","parts":[{"text":"hi"}]}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, changed := normalizeGeminiTrailingUserTurn(roles.ByName("gemini"), []byte(body))
+			if !changed {
+				t.Fatalf("a trailing model turn must be repaired: %s", body)
+			}
+			decoded := decodeBody(t, out)
+			contents := decoded["contents"].([]any)
+			last := contents[len(contents)-1].(map[string]any)
+			if last["role"] != "user" {
+				t.Fatalf("last turn role = %v, want user (%s)", last["role"], out)
+			}
+			parts := last["parts"].([]any)
+			text, ok := parts[0].(map[string]any)["text"].(string)
+			if !ok || text == "" {
+				// The gateway drops empty text parts, so the cue must survive as
+				// a non-empty (whitespace is enough) text part.
+				t.Errorf("the synthetic user turn must carry a non-empty cue: %s", out)
+			}
+			// The prefill is preserved, not overwritten.
+			if len(contents) < 2 {
+				t.Fatalf("the prefill turn disappeared: %s", out)
+			}
+			prefill := contents[len(contents)-2].(map[string]any)
+			if prefill["role"] != "model" && prefill["role"] != "assistant" {
+				t.Errorf("history was rewritten: %s", out)
+			}
+			// Unrelated top-level fields are kept.
+			if name == "model_turn" {
+				config := decoded["generationConfig"].(map[string]any)
+				if config["maxOutputTokens"] != float64(16) {
+					t.Errorf("generationConfig was not preserved: %s", out)
+				}
+			}
+		})
+	}
+}
+
+func TestNormalizeGeminiTrailingUserTurnNoops(t *testing.T) {
+	for name, body := range map[string]string{
+		"already_user":      `{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"ok"}]},{"role":"user","parts":[{"text":"next"}]}]}`,
+		"empty_contents":    `{"contents":[],"generationConfig":{"maxOutputTokens":8}}`,
+		"no_contents":       `{"systemInstruction":{"parts":[{"text":"sys"}]}}`,
+		"malformed":         `{"contents":[{"role":"model","parts":[{"text":"hi"}`,
+		"unknown_last_role": `{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"system","parts":[{"text":"x"}]}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, changed := normalizeGeminiTrailingUserTurn(roles.ByName("gemini"), []byte(body))
+			if changed || string(out) != body {
+				t.Errorf("body must pass through unchanged: %q -> %q (changed=%v)", body, out, changed)
+			}
+		})
+	}
+
+	// The trailing-model repair belongs to the GenAI face; the other families
+	// carry their own prefill semantics.
+	chatBody := `{"messages":[{"role":"assistant","content":"prefill"}]}`
+	if out, changed := normalizeGeminiTrailingUserTurn(roles.ByName("chat"), []byte(chatBody)); changed || string(out) != chatBody {
+		t.Errorf("non-GenAI faces must not be rewritten: %s", out)
+	}
+}
+
+func TestNormalizeGeminiTrailingUserTurnKeepsToolResultTurn(t *testing.T) {
+	// A trailing model turn carrying functionResponse is the gateway's accepted
+	// shape for tool results; the model must answer it, so no cue is appended.
+	toolResult := `{"contents":[{"role":"user","parts":[{"text":"call f"}]},{"role":"model","parts":[{"functionResponse":{"name":"f","response":{"result":"ok"}}}]}]}`
+	out, changed := normalizeGeminiTrailingUserTurn(roles.ByName("gemini"), []byte(toolResult))
+	if changed || string(out) != toolResult {
+		t.Errorf("a tool-result turn must pass through unchanged: %s (changed=%v)", out, changed)
+	}
+
+	// A functionResponse that carries inline media is rejected as the final
+	// turn, so it still needs the synthetic user turn.
+	mediaResult := `{"contents":[{"role":"user","parts":[{"text":"call f"}]},{"role":"model","parts":[{"functionResponse":{"name":"f","response":{"result":"ok"},"parts":[{"inlineData":{"mimeType":"image/png","data":"AAA"}}]}}]}]}`
+	out, changed = normalizeGeminiTrailingUserTurn(roles.ByName("gemini"), []byte(mediaResult))
+	if !changed {
+		t.Fatal("a trailing tool-result turn with inline media must be repaired")
+	}
+	contents := decodeBody(t, out)["contents"].([]any)
+	if got := contents[len(contents)-1].(map[string]any)["role"]; got != "user" {
+		t.Errorf("last turn role = %v, want user", got)
+	}
+}
+
+func TestExecuteAppendsGeminiTrailingUserTurnBeforeSending(t *testing.T) {
+	var seen atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, _ := io.ReadAll(request.Body)
+		seen.Store(string(raw))
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"once upon a time"}]}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURLs = map[string]string{"gemini": server.URL}
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	// Two consecutive trailing assistant turns are exactly the shape that the
+	// host translates into two model turns and the gateway rejects.
+	result, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("gemini"),
+		Model: "gemini-4-argon",
+		Body:  []byte(`{"contents":[{"role":"user","parts":[{"text":"write"}]},{"role":"model","parts":[{"text":"once"}]},{"role":"model","parts":[{"text":"upon"}]}],"generationConfig":{"maxOutputTokens":16}}`),
+	})
+	if errExecute != nil {
+		t.Fatalf("a prefill GenAI request must not fail: %v", errExecute)
+	}
+	raw, _ := seen.Load().(string)
+	if raw == "" {
+		t.Fatal("no upstream request was recorded")
+	}
+	decoded := decodeBody(t, []byte(raw))
+	contents := decoded["contents"].([]any)
+	if got := contents[len(contents)-1].(map[string]any)["role"]; got != "user" {
+		t.Errorf("upstream body must end with a user turn, got role %v (%s)", got, raw)
+	}
+	if got := contents[len(contents)-2].(map[string]any)["role"]; got != "model" {
+		t.Errorf("the prefill turn must be preserved, got role %v (%s)", got, raw)
+	}
+	if !containsString(result.Repairs, "gemini-trailing-user") {
+		t.Errorf("the repair must be reported on the result: %v", result.Repairs)
+	}
+}
+
 func TestNormalizeTopPClampsOutOfRange(t *testing.T) {
 	cases := []struct {
 		name string
@@ -736,6 +868,45 @@ func TestExecuteDoesNotRetryOther503(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("upstream calls = %d, want 1 (no retry for an unclassified 503)", got)
+	}
+}
+
+func TestExecuteRetriesEndpointUnavailable429Once(t *testing.T) {
+	// Observed in production: the gateway answered a valid request with a 429
+	// whose body was the "Endpoint is unavailable" server error (without an
+	// error type). Treating it as a quota verdict cooled the key even though the
+	// key still had quota.
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if calls.Add(1) == 1 {
+			writer.WriteHeader(http.StatusTooManyRequests)
+			_, _ = writer.Write([]byte(`{"error":{"message":"Upstream request failed: Endpoint is unavailable."}}`))
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	result, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute must retry the endpoint-unavailable 429: %v", errExecute)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", result.StatusCode)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry on a fresh connection)", got)
 	}
 }
 
