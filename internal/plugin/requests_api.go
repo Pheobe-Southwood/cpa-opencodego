@@ -35,6 +35,7 @@ type RequestEntry struct {
 	Stream        bool      `json:"stream"`
 	Status        int       `json:"status,omitempty"`
 	Failed        bool      `json:"failed"`
+	Canceled      bool      `json:"canceled,omitempty"`
 	Error         string    `json:"error,omitempty"`
 	LogID         string    `json:"log_id,omitempty"`
 	Session       string    `json:"session,omitempty"`
@@ -62,6 +63,7 @@ type RequestEntry struct {
 type RequestTotals struct {
 	Requests        int64   `json:"requests"`
 	Failed          int64   `json:"failed"`
+	Canceled        int64   `json:"canceled"`
 	InputTokens     int64   `json:"input_tokens"`
 	OutputTokens    int64   `json:"output_tokens"`
 	TotalTokens     int64   `json:"total_tokens"`
@@ -151,6 +153,7 @@ func (r *Runtime) requestsPayload(query url.Values) RequestsPayload {
 	filtered := make([]RequestEntry, 0, len(rows))
 	seen := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
+		row = normalizeCanceledEntry(row)
 		if row.ID != "" {
 			if _, duplicate := seen[row.ID]; duplicate {
 				continue
@@ -213,6 +216,7 @@ func (r *Runtime) requestEntry(row reqlog.Entry, display string, clientIDs []str
 		Stream:              row.Stream,
 		Status:              row.Status,
 		Failed:              row.Failed(),
+		Canceled:            row.Canceled,
 		Error:               row.Error,
 		LogID:               row.LogID,
 		Session:             row.Session,
@@ -234,7 +238,7 @@ func (r *Runtime) requestEntry(row reqlog.Entry, display string, clientIDs []str
 	if roles.Name(row.Role) == roles.Gemini {
 		effective += row.Reasoning
 	}
-	if !entry.Failed && entry.TokensSeen && effective > 0 {
+	if !entry.Failed && !entry.Canceled && entry.TokensSeen && effective > 0 {
 		if row.Generationms > 0 {
 			entry.GenTPS = roundFloat(float64(effective)/(row.Generationms/1000), 2)
 		}
@@ -255,6 +259,26 @@ func (r *Runtime) requestEntry(row reqlog.Entry, display string, clientIDs []str
 			entry.CostUSD = roundFloat(float64(cost)/1e9, 9)
 		}
 	}
+	return entry
+}
+
+// normalizeCanceledEntry repairs rows written before the plugin learned to
+// separate a downstream cancel from an upstream failure. The host closes the
+// stream bridge when the client disconnects (or when the plugin instance is
+// unloaded), yet those rows were stored as finish=error with the host callback
+// message. The request log keeps seven days, so this read-time shim makes the
+// existing rows display correctly without rewriting the file; new rows carry
+// canceled=true directly.
+func normalizeCanceledEntry(entry reqlog.Entry) reqlog.Entry {
+	if entry.Canceled || !entry.Stream || entry.Status < 200 || entry.Status >= 300 || entry.Finish != "error" {
+		return entry
+	}
+	if !downstreamClosedMessage(entry.Error) {
+		return entry
+	}
+	entry.Canceled = true
+	entry.Finish = "canceled"
+	entry.Error = ""
 	return entry
 }
 
@@ -281,6 +305,8 @@ func requestTotals(entries []RequestEntry) RequestTotals {
 		totals.Requests++
 		if entry.Failed {
 			totals.Failed++
+		} else if entry.Canceled {
+			totals.Canceled++
 		} else if entry.Status >= 200 && entry.Status < 300 {
 			totals.UpstreamSuccess++
 		}

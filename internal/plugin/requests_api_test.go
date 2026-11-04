@@ -174,3 +174,59 @@ func TestRequestsPayloadWhenDisabled(t *testing.T) {
 		t.Error("a disabled log should explain itself")
 	}
 }
+
+// The request log must separate a downstream cancel from an upstream failure.
+// Rows written before the plugin learned the distinction (v2.0.11 and older)
+// carry the host callback message as an error; the read path repairs them so the
+// existing seven-day window does not keep showing them as failures.
+func TestRequestsPayloadSeparatesCanceledRows(t *testing.T) {
+	runtime := requestsRuntime(t)
+	now := time.Now().UTC()
+	store := runtime.reqLogStore()
+	store.Append(reqlog.Entry{
+		At: now.Add(-3 * time.Minute), Role: "chat", Model: "gemini-4-argon",
+		Stream: true, Status: 200, Finish: "canceled", Canceled: true,
+		TTFTms: 800, Generationms: 2000, Totalms: 4000,
+		Input: 10, Output: 10, TotalTokens: 20, TokensSeen: true,
+	})
+	store.Append(reqlog.Entry{
+		At: now.Add(-2 * time.Minute), Role: "chat", Model: "deepseek-v4.1-flash",
+		Stream: true, Status: 200, Finish: "error",
+		Error:  "host callback host.stream.emit: stream 42 is not open",
+		TTFTms: 700, Generationms: 1500, Totalms: 3000,
+	})
+	store.Append(reqlog.Entry{
+		At: now.Add(-time.Minute), Role: "chat", Model: "glm-5.3",
+		Stream: true, Status: 502, Error: "bad gateway", Totalms: 120,
+	})
+
+	payload := runtime.requestsPayload(url.Values{})
+	if payload.Totals.Requests != 3 || payload.Totals.Failed != 1 ||
+		payload.Totals.Canceled != 2 || payload.Totals.UpstreamSuccess != 0 {
+		t.Errorf("totals = %+v, want requests=3 failed=1 canceled=2 success=0", payload.Totals)
+	}
+	for _, entry := range payload.Entries {
+		switch entry.Model {
+		case "gemini-4-argon", "deepseek-v4.1-flash":
+			if entry.Failed || !entry.Canceled {
+				t.Errorf("canceled row = %+v, want failed=false canceled=true", entry)
+			}
+			if entry.Finish != "canceled" || entry.Error != "" {
+				t.Errorf("canceled row kept its failure markers: finish=%q error=%q", entry.Finish, entry.Error)
+			}
+			if entry.GenTPS != 0 || entry.E2ETPS != 0 {
+				t.Errorf("a canceled row must not report throughput: %+v", entry)
+			}
+		case "glm-5.3":
+			if !entry.Failed || entry.Canceled {
+				t.Errorf("upstream failure row = %+v, want failed=true canceled=false", entry)
+			}
+		}
+	}
+
+	// "仅失败" must keep showing only the real upstream failure.
+	failedOnly := runtime.requestsPayload(url.Values{"failed": {"1"}})
+	if len(failedOnly.Entries) != 1 || failedOnly.Entries[0].Model != "glm-5.3" {
+		t.Errorf("failed filter = %+v, want only the upstream failure", failedOnly.Entries)
+	}
+}

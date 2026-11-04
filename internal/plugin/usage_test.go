@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -293,6 +294,73 @@ func TestResolveKeyNameFromProjectedAuthID(t *testing.T) {
 	for authID, want := range cases {
 		if got := runtime.resolveKeyName(authID); got != want {
 			t.Errorf("resolveKeyName(%q) = %q, want %q", authID, got, want)
+		}
+	}
+}
+
+// The host records a downstream client cancel as Failed=true with status 499
+// (context.Canceled maps to nginx's 499). It must be counted apart from real
+// upstream failures, and it must not enter the throughput samples.
+func TestUsageCountsClientCancelApartFromFailures(t *testing.T) {
+	runtime := newStatsTestRuntime(t, roles.Chat)
+	at := time.Now().UTC().Add(-time.Minute)
+	sendUsage(t, runtime, pluginapi.UsageRecord{
+		Provider:    "cpa-opencodego",
+		Model:       "deepseek-v4.1-flash",
+		RequestedAt: at,
+		Stream:      true,
+		Failed:      true,
+		Failure:     pluginapi.UsageFailure{StatusCode: 499, Body: "context canceled"},
+		Latency:     12 * time.Second,
+	})
+	sendUsage(t, runtime, pluginapi.UsageRecord{
+		Provider:    "cpa-opencodego",
+		Model:       "deepseek-v4.1-flash",
+		RequestedAt: at,
+		Stream:      true,
+		Failed:      true,
+		Failure:     pluginapi.UsageFailure{StatusCode: 502, Body: "bad gateway"},
+		Latency:     3 * time.Second,
+		Detail:      pluginapi.UsageDetail{InputTokens: 10, OutputTokens: 20, TotalTokens: 30},
+	})
+
+	model, exists := runtime.statsStore().Snapshot(time.Time{}).Models["deepseek-v4.1-flash"]
+	if !exists {
+		t.Fatal("usage records did not reach the store")
+	}
+	if model.Counter.Requests != 2 || model.Counter.Canceled != 1 || model.Counter.Failed != 1 {
+		t.Errorf("requests/canceled/failed = %+v, want 2/1/1", model.Counter)
+	}
+	if model.Counter.LatencySamples != 0 || model.Counter.StreamOutput != 0 {
+		t.Errorf("canceled and failed requests must not enter TPS/stream-output samples: %+v", model.Counter)
+	}
+
+	payload := runtime.statsPayload(url.Values{"range": {"all"}})
+	if len(payload.Models) != 1 {
+		t.Fatalf("models = %d, want 1", len(payload.Models))
+	}
+	row := payload.Models[0]
+	if row.CanceledRequests != 1 || row.FailedRequests != 1 || row.Requests != 2 {
+		t.Errorf("stats payload = %+v, want requests=2 failed=1 canceled=1", row.StatsCounts)
+	}
+}
+
+func TestClientCanceledUsageRecognition(t *testing.T) {
+	cases := []struct {
+		name   string
+		record pluginapi.UsageRecord
+		want   bool
+	}{
+		{"499 status", pluginapi.UsageRecord{Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 499}}, true},
+		{"context canceled body", pluginapi.UsageRecord{Failed: true, Failure: pluginapi.UsageFailure{Body: "context canceled"}}, true},
+		{"client closed request body", pluginapi.UsageRecord{Failed: true, Failure: pluginapi.UsageFailure{Body: "client closed request"}}, true},
+		{"upstream 502", pluginapi.UsageRecord{Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 502, Body: "bad gateway"}}, false},
+		{"upstream 400", pluginapi.UsageRecord{Failed: true, Failure: pluginapi.UsageFailure{StatusCode: 400, Body: "invalid request"}}, false},
+		{"not failed", pluginapi.UsageRecord{}, false},
+	}
+	for _, tc := range cases {
+		if got := clientCanceledUsage(tc.record); got != tc.want {
+			t.Errorf("%s: clientCanceledUsage = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

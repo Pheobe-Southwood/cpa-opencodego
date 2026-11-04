@@ -229,3 +229,51 @@ func TestMergeTimingIgnoresSiblingTokens(t *testing.T) {
 		t.Errorf("MergeTiming lost timing: %+v", main)
 	}
 }
+
+// A canceled request is counted as a request and as canceled, never as failed,
+// and it never contributes stream-output or throughput samples.
+func TestStoreCountsCanceledApartFromFailed(t *testing.T) {
+	store, path := openTemp(t, "chat")
+	at := time.Date(2026, 11, 4, 2, 33, 0, 0, time.UTC)
+	store.ObserveUsage(UsageSample{
+		Model: "gemini-4-argon", Family: "gemini", Key: "main", At: at,
+		Stream: true, Canceled: true, Priced: true,
+		Input: 100, Output: 10, Total: 110,
+		Latency: 4 * time.Second, TPSOutput: 10,
+	})
+
+	model, exists := store.Snapshot(time.Time{}).Models["gemini-4-argon"]
+	if !exists {
+		t.Fatal("canceled usage did not reach the store")
+	}
+	if model.Counter.Requests != 1 || model.Counter.Canceled != 1 || model.Counter.Failed != 0 {
+		t.Errorf("requests/canceled/failed = %+v, want 1/1/0", model.Counter)
+	}
+	if model.Counter.StreamOutput != 0 || model.Counter.StreamOutputSamples != 0 ||
+		model.Counter.LatencySamples != 0 || model.Counter.LatencyOutput != 0 {
+		t.Errorf("a canceled request must not enter TPS/stream-output samples: %+v", model.Counter)
+	}
+	store.Flush()
+	file, errRead := ReadFile(path, "chat")
+	if errRead != nil {
+		t.Fatalf("ReadFile: %v", errRead)
+	}
+	persisted := file.Models["gemini-4-argon"]
+	if persisted == nil {
+		t.Fatal("canceled usage was not persisted")
+	}
+	hour := persisted.Hours["2026-11-04T02"]
+	if hour.Canceled != 1 || hour.Failed != 0 || hour.Requests != 1 {
+		t.Errorf("hour bucket = %+v, want one canceled request", hour)
+	}
+
+	var merged Counter
+	merged.Add(model.Counter)
+	merged.Add(model.Counter)
+	if merged.Canceled != 2 || merged.Failed != 0 {
+		t.Errorf("merged counter = %+v, want canceled=2 failed=0", merged)
+	}
+	if merged.Empty() {
+		t.Error("a counter with canceled requests is not empty")
+	}
+}

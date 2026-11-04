@@ -84,16 +84,26 @@ type Entry struct {
 	TokensSeen bool `json:"tokens_seen,omitempty"`
 	// Repairs lists compatibility fixes applied to this request (e.g. "developer-role", "reasoning-replay").
 	Repairs []string `json:"repairs,omitempty"`
-	// Finish is the completion reason ("stop", "length", "tool_calls", "eof", "error").
+	// Finish is the completion reason ("stop", "length", "tool_calls", "eof", "canceled", "error").
 	Finish string `json:"finish,omitempty"`
 	// Incomplete reports whether an SSE stream truncated before carrying any finish_reason marker.
 	Incomplete bool `json:"incomplete,omitempty"`
+	// Canceled reports that the downstream client (or the host shutting the
+	// stream bridge down) ended the request before the response completed. The
+	// upstream itself was healthy, so a canceled attempt is not a failure.
+	Canceled bool `json:"canceled,omitempty"`
 	// Version is the record schema version, written for forward compatibility.
 	Version int `json:"version,omitempty"`
 }
 
-// Failed reports whether the attempt failed.
-func (e Entry) Failed() bool { return e.Status >= 400 || strings.TrimSpace(e.Error) != "" }
+// Failed reports whether the attempt failed. A downstream cancellation is not a
+// failure: the upstream produced a normal response and only the client left.
+func (e Entry) Failed() bool {
+	if e.Canceled {
+		return false
+	}
+	return e.Status >= 400 || strings.TrimSpace(e.Error) != ""
+}
 
 // Failed returns true when the entry is older than the retention window.
 func (e Entry) Expired(now time.Time) bool {

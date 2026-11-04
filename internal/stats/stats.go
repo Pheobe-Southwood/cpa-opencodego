@@ -38,6 +38,7 @@ const bucketLayout = "2006-01-02T15"
 type Counter struct {
 	Requests            int64 `json:"requests,omitempty"`
 	Failed              int64 `json:"failed_requests,omitempty"`
+	Canceled            int64 `json:"canceled_requests,omitempty"`
 	Streams             int64 `json:"stream_requests,omitempty"`
 	Unmetered           int64 `json:"unmetered_requests,omitempty"`
 	Priced              int64 `json:"priced_requests,omitempty"`
@@ -77,6 +78,7 @@ type Counter struct {
 func (c *Counter) Add(other Counter) {
 	c.Requests += other.Requests
 	c.Failed += other.Failed
+	c.Canceled += other.Canceled
 	c.Streams += other.Streams
 	c.Unmetered += other.Unmetered
 	c.Priced += other.Priced
@@ -113,7 +115,7 @@ func (c *Counter) MergeTiming(other Counter) {
 // Empty reports whether the counter has recorded any events.
 func (c Counter) Empty() bool {
 	return c.Requests == 0 && c.Total == 0 && c.TTFTSamples == 0 && c.GenSamples == 0 &&
-		c.LatencySamples == 0 && c.StreamOutputSamples == 0 && c.CostNanoUSD == 0
+		c.LatencySamples == 0 && c.StreamOutputSamples == 0 && c.CostNanoUSD == 0 && c.Canceled == 0
 }
 
 func (c Counter) empty() bool {
@@ -137,7 +139,11 @@ type UsageSample struct {
 	Priced        bool
 	Stream        bool
 	Failed        bool
-	Unmetered     bool
+	// Canceled marks a request the downstream client aborted before the
+	// response completed. The upstream did not fail, so it is counted apart
+	// from Failed and never enters the throughput samples.
+	Canceled  bool
+	Unmetered bool
 	// Latency is the host-reported wall-clock duration of this request. It is
 	// paired with TPSOutput below, so TPS is computed from one usage record.
 	Latency time.Duration
@@ -206,10 +212,12 @@ func (m *ModelStats) addUsage(sample UsageSample, at time.Time) {
 	}
 	if sample.Failed {
 		counter.Failed = 1
+	} else if sample.Canceled {
+		counter.Canceled = 1
 	}
 	if sample.Stream {
 		counter.Streams = 1
-		if !sample.Failed && sample.Output > 0 {
+		if !sample.Failed && !sample.Canceled && sample.Output > 0 {
 			counter.StreamOutput = sample.Output
 			counter.StreamOutputSamples = 1
 		}
@@ -224,9 +232,10 @@ func (m *ModelStats) addUsage(sample UsageSample, at time.Time) {
 		counter.Unpriced = 1
 	}
 	// TPS is intentionally end-to-end: output tokens / host-reported latency.
-	// Both sides come from this same usage record. Failed requests are excluded
-	// so a timeout with partial output does not depress the throughput estimate.
-	if !sample.Failed && sample.TPSOutput > 0 && sample.Latency > 0 {
+	// Both sides come from this same usage record. Failed and canceled requests
+	// are excluded so a timeout or a client abort with partial output does not
+	// depress the throughput estimate.
+	if !sample.Failed && !sample.Canceled && sample.TPSOutput > 0 && sample.Latency > 0 {
 		counter.LatencyOutput = sample.TPSOutput
 		counter.LatencyNano = int64(sample.Latency)
 		counter.LatencySamples = 1

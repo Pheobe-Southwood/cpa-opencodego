@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"github.com/Pheobe-Southwood/cpa-opencodego/internal/abi"
@@ -263,5 +265,157 @@ func TestHandleExecuteRefusesToPickAmongKeys(t *testing.T) {
 	rows := runtime.reqLogStore().Snapshot()
 	if len(rows) != 1 || rows[0].Key != "" || rows[0].Status != http.StatusServiceUnavailable {
 		t.Fatalf("request log = %+v, want one failed row with no key", rows)
+	}
+}
+
+// A downstream cancel must not be recorded as an upstream failure. The host
+// binds the stream bridge to the client request context: when the client
+// disconnects (or the plugin instance is unloaded) the stream is removed and
+// the next emit fails with the host's closed-stream error. The upstream had
+// already produced content and did not fail.
+func TestPumpStreamRecordsDownstreamCancel(t *testing.T) {
+	cases := []struct {
+		name    string
+		emitErr error
+	}{
+		{"stream bridge closed", errors.New("stream 42 is not open")},
+		{"plugin instance unloaded", errors.New("host plugin callback instance is closed")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := newStatsTestRuntime(t, roles.Chat)
+			var closeNote atomic.Value
+			stubHostCall(t, func(method string, payload []byte) ([]byte, error) {
+				switch method {
+				case pluginabi.MethodHostStreamEmit:
+					return nil, tc.emitErr
+				case pluginabi.MethodHostStreamClose:
+					var request streamCloseRequest
+					_ = json.Unmarshal(payload, &request)
+					closeNote.Store(request.Error)
+					return abi.OK(map[string]any{})
+				default:
+					return abi.OK(map[string]any{})
+				}
+			})
+
+			sse := "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n"
+			runtime.pumpStream(&upstream.Stream{
+				StatusCode: 200,
+				Body:       io.NopCloser(strings.NewReader(sse)),
+			}, "stream-cancel", streamTiming{model: "deepseek-v4.1-flash", key: "main", started: time.Now().Add(-time.Second)})
+
+			rows := runtime.reqLogStore().Snapshot()
+			if len(rows) != 1 {
+				t.Fatalf("rows = %d, want 1", len(rows))
+			}
+			row := rows[0]
+			if !row.Canceled {
+				t.Errorf("a closed host stream must be recorded as canceled: %+v", row)
+			}
+			if row.Failed() {
+				t.Errorf("a downstream cancel must not be a failure: %+v", row)
+			}
+			if row.Finish != "canceled" {
+				t.Errorf("finish = %q, want canceled", row.Finish)
+			}
+			if row.Error != "" {
+				t.Errorf("a canceled row must not keep the host callback message as an error: %q", row.Error)
+			}
+			if note, _ := closeNote.Load().(string); note != "" {
+				t.Errorf("close note = %q, want an empty close so the host does not write to a dead stream", note)
+			}
+			if _, exists := runtime.statsStore().Snapshot(time.Time{}).Models["deepseek-v4.1-flash"]; exists {
+				t.Error("a canceled stream must not produce a TTFT timing sample")
+			}
+		})
+	}
+}
+
+// The classification is deliberately narrow: a host callback failure that is
+// not a closed stream (e.g. a broken plugin/host envelope) is still a failure.
+func TestPumpStreamKeepsNonCancelHostFailure(t *testing.T) {
+	runtime := newStatsTestRuntime(t, roles.Chat)
+	stubHostCall(t, func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostStreamEmit {
+			return nil, errors.New("decode envelope: unexpected end of JSON input")
+		}
+		return abi.OK(map[string]any{})
+	})
+
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n"
+	runtime.pumpStream(&upstream.Stream{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}, "stream-broken", streamTiming{model: "glm-5.3", key: "main", started: time.Now()})
+
+	rows := runtime.reqLogStore().Snapshot()
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.Canceled {
+		t.Errorf("a non-cancel host failure must not be marked canceled: %+v", row)
+	}
+	if !row.Failed() || row.Finish != "error" || row.Error == "" {
+		t.Errorf("a non-cancel host failure must stay failed: %+v", row)
+	}
+}
+
+func TestDownstreamClosedMessages(t *testing.T) {
+	cases := []struct {
+		message string
+		want    bool
+	}{
+		{"host callback host.stream.emit: stream 609 is not open", true},
+		{"host callback host.stream.emit: host plugin callback instance is closed", true},
+		{"host callback host.stream.emit: context canceled", true},
+		{"host callback host.stream.emit: client closed request", true},
+		{"host callback host.stream.emit: decode envelope: boom", false},
+		{"upstream 502 bad gateway", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := downstreamClosedMessage(tc.message); got != tc.want {
+			t.Errorf("downstreamClosedMessage(%q) = %v, want %v", tc.message, got, tc.want)
+		}
+	}
+	if downstreamClosed(nil) {
+		t.Error("a nil error is not a cancellation")
+	}
+	if !downstreamClosed(errors.New("stream 1 is not open")) {
+		t.Error("wrapped host stream errors must be recognized")
+	}
+}
+
+// An upstream error frame is authoritative even when the following emit fails
+// because the client disconnected: the row must stay a failure.
+func TestPumpStreamUpstreamErrorWinsOverCancel(t *testing.T) {
+	runtime := newStatsTestRuntime(t, roles.Chat)
+	stubHostCall(t, func(method string, payload []byte) ([]byte, error) {
+		if method == pluginabi.MethodHostStreamEmit && strings.Contains(string(payload), "server_error") {
+			return nil, errors.New("stream 9 is not open")
+		}
+		return abi.OK(map[string]any{})
+	})
+
+	sse := "" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n" +
+		"data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n"
+	runtime.pumpStream(&upstream.Stream{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}, "stream-upstream-error", streamTiming{model: "glm-5.3", key: "main", started: time.Now()})
+
+	rows := runtime.reqLogStore().Snapshot()
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.Canceled || !row.Failed() {
+		t.Errorf("an upstream error frame must stay a failure even if the client leaves: %+v", row)
+	}
+	if row.Finish != "error" || row.Error == "" {
+		t.Errorf("finish=%q error=%q, want error with a message", row.Finish, row.Error)
 	}
 }

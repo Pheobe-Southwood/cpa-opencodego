@@ -1,6 +1,7 @@
 package reqlog
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,5 +139,41 @@ func TestReadFileIgnoresForeignRole(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("foreign rows = %+v", rows)
+	}
+}
+
+// A canceled attempt is not a failure even when an older row still carries the
+// host callback message that produced the error text.
+func TestCanceledEntryIsNotFailed(t *testing.T) {
+	entry := Entry{
+		Status:   200,
+		Stream:   true,
+		Finish:   "canceled",
+		Canceled: true,
+		Error:    "host callback host.stream.emit: stream 3 is not open",
+	}
+	if entry.Failed() {
+		t.Errorf("a canceled entry must not be failed: %+v", entry)
+	}
+
+	// Without the explicit flag the same text is still a failure; the plugin
+	// only reclassifies rows whose error it can attribute to a closed stream.
+	entry.Canceled = false
+	if !entry.Failed() {
+		t.Error("an error text without the canceled flag must stay a failure")
+	}
+
+	// The flag must survive the JSONL round trip used by the cross-face reader.
+	entry.Canceled = true
+	raw, errMarshal := json.Marshal(entry)
+	if errMarshal != nil {
+		t.Fatalf("marshal: %v", errMarshal)
+	}
+	var decoded Entry
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatalf("unmarshal: %v", errUnmarshal)
+	}
+	if !decoded.Canceled || decoded.Failed() || decoded.Finish != "canceled" {
+		t.Errorf("round trip lost the canceled state: %+v", decoded)
 	}
 }

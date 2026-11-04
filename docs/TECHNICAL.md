@@ -81,7 +81,8 @@ OpenCode Go 新网关的 gRPC 前端对部分节点存在两处偶发的 400 严
 1. **默认 `developer-role: retry-only`**：首次请求逐字节保留原始 `developer` 角色透传；仅当命中上述 developer 400 时才改写为 `system` 并立即重试一次。`rewrite` 模式保持主动预先改写，`keep` 模式保持纯透传不重试。
 2. **默认 `reasoning-replay: retry-only`**：首次请求保留原始历史透传；仅当命中上述 reasoning 400 时，才为历史 assistant 消息补齐中性占位符 `[reasoning unavailable]` 并重试一次。**重试成功后自动为该 `x-opencode-session` 开启 sticky 记忆**（TTL 2 小时，上限 4096 条），后续该会话请求提前补齐，既避免每一轮都承担 400 重试往返，又稳定了前缀缓存（Prompt Cache）命中率。
 3. **修复阶梯保护**：单次请求最多允许 3 次上游尝试（developer 修复与 reasoning 修复各一次），同一修复不重复尝试，非 400 或不可恢复错误立即返回。
-4. **流截断诊断**：请求日志新增 `repairs`、`finish`（`stop`、`length`、`tool_calls`、`eof`、`error`）与 `incomplete` 字段；当上游 SSE 未返回 `finish_reason` 即异常断开时，请求日志状态列清晰标出「截断」，便于定位网络与网关中途丢流问题。
+4. **流截断诊断**：请求日志新增 `repairs`、`finish`（`stop`、`length`、`tool_calls`、`eof`、`canceled`、`error`）与 `incomplete` 字段；当上游 SSE 未返回 `finish_reason` 即异常断开时，请求日志状态列清晰标出「截断」，便于定位网络与网关中途丢流问题。
+5. **下游取消与上游失败分离**：宿主把异步流桥接绑定到下游请求上下文，客户端断开时宿主会移除该 stream，插件的下一次 `host.stream.emit` 会收到 `stream N is not open` / `host plugin callback instance is closed`。这类请求的上游本身是成功的（HTTP 200、已产出内容），只是客户端提前离开；插件将其记为 `finish=canceled`、`canceled=true`，不计入失败。统计侧同样把宿主 usage 事件中的 499（`context.Canceled`）记为「取消」而非失败，真实的上游 4xx/5xx 仍保持失败。
 
 改写只重编码 `messages` 数组中受影响的对象，其余顶层字段保持逐字节不变。
 

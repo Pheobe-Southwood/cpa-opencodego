@@ -1443,6 +1443,7 @@ const pageScript = `
     var requestSub = [];
     if(model.stream_requests) requestSub.push(model.stream_requests + ' 流式');
     if(model.failed_requests) requestSub.push(model.failed_requests + ' 失败');
+    if(model.canceled_requests) requestSub.push(model.canceled_requests + ' 取消');
     if(model.unmetered_requests) requestSub.push(model.unmetered_requests + ' 未上报');
     var requests = '<span class="stats-cell-main">' + Number(model.requests || 0).toLocaleString() + '</span>' +
       (requestSub.length ? '<span class="stats-sub">' + esc(requestSub.join(' · ')) + '</span>' : '');
@@ -1667,8 +1668,11 @@ const pageScript = `
     var box = el('requestSummary');
     if(!box) return;
     var totals = (requests && requests.totals) || {};
+    var outcome = [];
+    if(totals.failed) outcome.push(totals.failed + ' 失败');
+    if(totals.canceled) outcome.push(totals.canceled + ' 取消');
     var stats = [
-      ['请求', Number(totals.requests || 0).toLocaleString(), totals.failed ? totals.failed + ' 失败' : '全部成功'],
+      ['请求', Number(totals.requests || 0).toLocaleString(), outcome.length ? outcome.join(' · ') : '全部成功'],
       ['输入 token', formatTokens(totals.input_tokens), '本次筛选范围'],
       ['输出 token', formatTokens(totals.output_tokens), '本次筛选范围'],
       ['平均 TTFT', totals.ttft_samples ? formatTTFT(totals.avg_ttft_ms) : '—', (totals.ttft_samples || 0) + ' 个样本'],
@@ -1681,9 +1685,10 @@ const pageScript = `
     }).join('');
   }
   function requestStatusCell(entry){
-    var level = entry.failed ? 'err' : (entry.status >= 200 && entry.status < 300 ? 'ok' : '');
+    var level = entry.failed ? 'err' : (entry.canceled ? 'warn' : (entry.status >= 200 && entry.status < 300 ? 'ok' : ''));
     var label = entry.status ? String(entry.status) : (entry.error ? '失败' : '—');
     var html = '<span class="pill ' + level + '">' + esc(label) + '</span>';
+    if(entry.canceled) html += '<span class="pill warn" title="下游客户端在响应完成前断开，不计为失败">取消</span>';
     if(entry.incomplete) html += '<span class="pill warn" title="上游流式在返回 finish_reason 前意外结束">截断</span>';
     if(entry.repairs && entry.repairs.length) html += '<span class="pill accent" title="触发兼容修复: ' + esc(entry.repairs.join(', ')) + '">修复</span>';
     if(entry.error) html += '<span class="stats-sub err-text" title="' + esc(entry.error) + '">' + esc(shorten(entry.error, 40)) + '</span>';

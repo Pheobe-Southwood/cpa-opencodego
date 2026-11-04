@@ -145,6 +145,8 @@ func TestPageHasRequestLogTab(t *testing.T) {
 		"scheduleRequestsTimer",
 		"entry.incomplete",
 		"entry.repairs",
+		"entry.canceled",
+		"取消",
 	} {
 		if !strings.Contains(document, want) {
 			t.Errorf("the page is missing %q", want)

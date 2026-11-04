@@ -173,6 +173,7 @@ func (r *Runtime) usageSample(record pluginapi.UsageRecord) (stats.UsageSample, 
 	}
 
 	keyName := r.resolveKeyName(record.AuthID)
+	canceled := clientCanceledUsage(record)
 
 	return stats.UsageSample{
 		Model:         model,
@@ -189,11 +190,33 @@ func (r *Runtime) usageSample(record pluginapi.UsageRecord) (stats.UsageSample, 
 		CostNanoUSD:   costNano,
 		Priced:        priced,
 		Stream:        record.Stream,
-		Failed:        record.Failed,
+		Failed:        record.Failed && !canceled,
+		Canceled:      canceled,
 		Unmetered:     unmetered,
 		Latency:       record.Latency,
 		TPSOutput:     tpsOutput,
 	}, true
+}
+
+// statusClientClosedRequest is the nginx-style status the host records when the
+// downstream client disconnects before the proxy finished. CPA maps a canceled
+// request context to this status (clienterror.StatusClientClosedRequest), so a
+// failed usage record with it is a client cancel, not an upstream failure.
+const statusClientClosedRequest = 499
+
+// clientCanceledUsage reports whether a failed usage record describes a
+// downstream client cancel (or a host shutdown that canceled the request)
+// rather than an upstream failure. Upstream 4xx/5xx records keep Failed=true:
+// only the explicit 499 status or the cancellation wording is reclassified.
+func clientCanceledUsage(record pluginapi.UsageRecord) bool {
+	if !record.Failed {
+		return false
+	}
+	if record.Failure.StatusCode == statusClientClosedRequest {
+		return true
+	}
+	body := strings.ToLower(strings.TrimSpace(record.Failure.Body))
+	return strings.Contains(body, "context canceled") || strings.Contains(body, "client closed request")
 }
 
 // resolveKeyName maps the host's auth id (the projected auth file name) back to

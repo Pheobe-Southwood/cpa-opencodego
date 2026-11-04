@@ -20,6 +20,7 @@ import (
 type StatsCounts struct {
 	Requests          int64   `json:"requests"`
 	FailedRequests    int64   `json:"failed_requests"`
+	CanceledRequests  int64   `json:"canceled_requests"`
 	StreamRequests    int64   `json:"stream_requests"`
 	UnmeteredRequests int64   `json:"unmetered_requests"`
 	PricedRequests    int64   `json:"priced_requests"`
@@ -506,6 +507,7 @@ func statsCountsFrom(counter stats.Counter) StatsCounts {
 	return StatsCounts{
 		Requests:          counter.Requests,
 		FailedRequests:    counter.Failed,
+		CanceledRequests:  counter.Canceled,
 		StreamRequests:    counter.Streams,
 		UnmeteredRequests: counter.Unmetered,
 		PricedRequests:    counter.Priced,

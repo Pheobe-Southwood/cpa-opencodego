@@ -130,7 +130,7 @@ func (r *Runtime) handleExecute(request []byte) []byte {
 	result, errExecute := r.client.Execute(context.Background(), call)
 	if errExecute != nil {
 		attempt.repairs = result.Repairs
-		r.recordAttempt(attempt, started, result.Headers, reqlog.Usage{}, abi.Status(errExecute), errExecute.Error(), 0, 0, "error", false)
+		r.recordAttempt(attempt, started, result.Headers, reqlog.Usage{}, abi.Status(errExecute), errExecute.Error(), 0, 0, "error", false, false)
 		return abi.FailFor(errExecute, "upstream_error")
 	}
 
@@ -140,7 +140,7 @@ func (r *Runtime) handleExecute(request []byte) []byte {
 		payload = terminalEventPayload(payload)
 	}
 	attempt.repairs = result.Repairs
-	r.recordAttempt(attempt, started, result.Headers, usage, result.StatusCode, "", 0, 0, "stop", false)
+	r.recordAttempt(attempt, started, result.Headers, usage, result.StatusCode, "", 0, 0, "stop", false, false)
 
 	raw, errMarshal := abi.OK(pluginapi.ExecutorResponse{
 		Payload: payload,
@@ -188,7 +188,7 @@ func (r *Runtime) handleExecuteStream(request []byte) []byte {
 	stream, errStream := r.client.Stream(context.Background(), call)
 	if errStream != nil {
 		r.trace("execute_stream upstream error", map[string]any{"model": call.Model, "error": errStream.Error()})
-		r.recordAttempt(attempt, started, nil, reqlog.Usage{}, abi.Status(errStream), errStream.Error(), 0, 0, "error", false)
+		r.recordAttempt(attempt, started, nil, reqlog.Usage{}, abi.Status(errStream), errStream.Error(), 0, 0, "error", false, false)
 		return abi.FailFor(errStream, "upstream_error")
 	}
 	r.trace("execute_stream upstream ok", map[string]any{"model": call.Model, "status": stream.StatusCode})
@@ -211,7 +211,7 @@ func (r *Runtime) handleExecuteStream(request []byte) []byte {
 		payload, _ := io.ReadAll(stream.Body)
 		_ = stream.Body.Close()
 		r.recordAttempt(attempt, started, stream.Headers, reqlog.ParseBody(r.role.Name, payload),
-			stream.StatusCode, "", 0, 0, "stop", false)
+			stream.StatusCode, "", 0, 0, "stop", false, false)
 		raw, errMarshal := abi.OK(map[string]any{
 			"headers": headers,
 			"chunks":  []pluginapi.ExecutorStreamChunk{{Payload: payload}},
@@ -278,6 +278,7 @@ func (r *Runtime) pumpStream(stream *upstream.Stream, streamID string, timing st
 	closeMessage := ""
 	emitted := 0
 	streamError := false
+	canceled := false
 	firstContent := time.Time{}
 	lastContent := time.Time{}
 	finishKind := ""
@@ -304,6 +305,7 @@ func (r *Runtime) pumpStream(stream *upstream.Stream, streamID string, timing st
 				accumulator.Observe(chunk)
 				if errEmit := emitStreamChunk(streamID, chunk); errEmit != nil {
 					closeMessage = errEmit.Error()
+					canceled = downstreamClosed(errEmit)
 					break
 				}
 				emitted++
@@ -324,8 +326,15 @@ func (r *Runtime) pumpStream(stream *upstream.Stream, streamID string, timing st
 		}
 	} else if streamError {
 		finishKind = "error"
+	} else if canceled {
+		finishKind = "canceled"
 	} else if closeMessage != "" {
 		finishKind = "error"
+	}
+	if streamError {
+		// An upstream error frame is authoritative: if the client disconnected
+		// only after the upstream reported an error, the row stays a failure.
+		canceled = false
 	}
 	ttft, generation := streamTimingValues(timing.started, firstContent, lastContent)
 	attempt := timing.attempt
@@ -343,20 +352,28 @@ func (r *Runtime) pumpStream(stream *upstream.Stream, streamID string, timing st
 	if errorText == "" && streamError {
 		errorText = "upstream stream error frame"
 	}
+	if canceled {
+		// The host closed the stream because the downstream client went away (or
+		// the plugin instance is being unloaded). The upstream did not fail, so
+		// the row keeps the measured timings but is not recorded as an error.
+		errorText = ""
+	}
 	r.recordAttempt(attempt, timing.started, stream.Headers, accumulator.Usage(),
-		stream.StatusCode, errorText, ttft, generation, finishKind, incomplete)
+		stream.StatusCode, errorText, ttft, generation, finishKind, incomplete, canceled)
 	r.trace("stream finished", map[string]any{
 		"role":       string(r.role.Name),
 		"stream_id":  streamID,
 		"chunks":     emitted,
 		"close_note": closeMessage,
 		"stream_err": streamError,
+		"canceled":   canceled,
 		"ttft_ms":    float64(ttft.Microseconds()) / 1000,
 		"gen_ms":     float64(generation.Microseconds()) / 1000,
 	})
-	// A stream with no content, an upstream error frame, or a broken transport
-	// has no meaningful TTFT. Failed/partial streams must not lower the average.
-	if closeMessage == "" && !streamError && timing.model != "" && ttft > 0 {
+	// A stream with no content, an upstream error frame, a broken transport, or
+	// a downstream cancel has no meaningful TTFT. Failed/partial streams must
+	// not lower the average.
+	if closeMessage == "" && !streamError && !canceled && timing.model != "" && ttft > 0 {
 		if store := r.statsStore(); store != nil {
 			store.ObserveTiming(stats.TimingSample{
 				Model:      timing.model,
@@ -368,7 +385,11 @@ func (r *Runtime) pumpStream(stream *upstream.Stream, streamID string, timing st
 			})
 		}
 	}
-	closeStream(streamID, closeMessage)
+	closeNote := closeMessage
+	if canceled {
+		closeNote = ""
+	}
+	closeStream(streamID, closeNote)
 }
 
 // streamTimingValues turns the content timestamps into TTFT and generation
@@ -433,6 +454,41 @@ func closeStream(streamID, message string) {
 		StreamID: streamID,
 		Error:    message,
 	}, nil)
+}
+
+// downstreamClosed reports whether a host stream callback failed because the
+// host closed the stream underneath the plugin. The host binds the stream to
+// the downstream request context: when the client disconnects, or the plugin
+// instance is unloaded during a host restart, the stream id is removed and the
+// next emit returns "stream N is not open" / "plugin callback instance is
+// closed" (or the callback context's own cancellation error). The upstream was
+// healthy in all of those cases, so they must not be recorded as failures.
+func downstreamClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	return downstreamClosedMessage(err.Error())
+}
+
+// downstreamClosedMessage matches the host's stream-bridge cancellation
+// messages. It is shared with the request-log read path so rows written before
+// this classification existed are repaired on read.
+func downstreamClosedMessage(message string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(message))
+	if lowered == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"is not open",                 // stream bridge: "stream 609 is not open"
+		"callback instance is closed", // plugin instance unloaded by the host
+		"context canceled",            // host callback context canceled
+		"client closed request",       // HTTP 499 wording
+	} {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // terminalEventPayload wraps a bare OpenAI Responses body in the terminal
@@ -560,7 +616,7 @@ func (r *Runtime) newAttempt(requested, upstreamModel string, stream bool, cred 
 
 // recordAttempt appends one row to the request log. It is best effort: a log
 // failure is surfaced on the dashboard and never fails the request.
-func (r *Runtime) recordAttempt(attempt requestAttempt, started time.Time, headers http.Header, usage reqlog.Usage, status int, errorText string, ttft, generation time.Duration, finish string, incomplete bool) {
+func (r *Runtime) recordAttempt(attempt requestAttempt, started time.Time, headers http.Header, usage reqlog.Usage, status int, errorText string, ttft, generation time.Duration, finish string, incomplete, canceled bool) {
 	store := r.reqLogStore()
 	if store == nil {
 		return
@@ -593,6 +649,7 @@ func (r *Runtime) recordAttempt(attempt requestAttempt, started time.Time, heade
 		Repairs:       attempt.repairs,
 		Finish:        finish,
 		Incomplete:    incomplete,
+		Canceled:      canceled,
 	})
 }
 
