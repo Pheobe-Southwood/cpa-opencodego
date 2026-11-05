@@ -871,6 +871,44 @@ func TestExecuteDoesNotRetryOther503(t *testing.T) {
 	}
 }
 
+func TestExecuteEndpointUnavailable403FailsFastWithoutCredentialBlame(t *testing.T) {
+	// Production shape from the GenAI frontend: a 403 with no error type. The
+	// credential is healthy and the model's upstream endpoint is down, so the
+	// request must fail fast as a non-retryable client error. Passing the 403
+	// through makes CLIProxyAPI cool every key of the model for 30 minutes.
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = writer.Write([]byte(`{"error":{"code":403,"status":"UNKNOWN","message":"Upstream request failed: Endpoint is unavailable."}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	_, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4-pro",
+		Body:  []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute == nil {
+		t.Fatal("an endpoint-unavailable 403 must surface as an error")
+	}
+	if got := abi.Status(errExecute); got != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (request-scoped, not a credential fault)", got)
+	}
+	if strings.Contains(errExecute.Error(), "[k1]") {
+		t.Errorf("the refusal must not be attributed to a key: %v", errExecute)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (a request-scoped refusal must not be retried)", got)
+	}
+}
+
 func TestExecuteRetriesEndpointUnavailable429Once(t *testing.T) {
 	// Observed in production: the gateway answered a valid request with a 429
 	// whose body was the "Endpoint is unavailable" server error (without an

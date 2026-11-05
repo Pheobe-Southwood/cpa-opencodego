@@ -125,6 +125,41 @@ func TestUpstreamErrorKeepsRequestScoped403OutOfCredentialCooldown(t *testing.T)
 	}
 }
 
+// The gateway reports the same "Endpoint is unavailable" hiccup without an
+// error type on its GenAI frontend. The classifier must key off the message, or
+// a single provider-side outage cools every credential of the model.
+func TestUpstreamErrorTreatsUntypedEndpointUnavailable403AsRequestScoped(t *testing.T) {
+	bodies := []string{
+		// Observed in production on the GenAI face: no error type at all.
+		`{"error":{"code":403,"status":"UNKNOWN","message":"Upstream request failed: Endpoint is unavailable."}}`,
+		`{"error":{"message":"Upstream request failed: Endpoint is unavailable."}}`,
+		`{"type":"error","error":{"code":"403","message":"Endpoint is unavailable."}}`,
+	}
+	for _, body := range bodies {
+		errRefusal := upstreamError(http.StatusForbidden, []byte(body), "keyqq2")
+		if got := abi.Status(errRefusal); got != http.StatusBadRequest {
+			t.Errorf("status for %s = %d, want 400", body, got)
+		}
+		if strings.Contains(errRefusal.Error(), "[keyqq2]") {
+			t.Errorf("an endpoint-unavailable refusal must not be attributed to a key: %v", errRefusal)
+		}
+		if !strings.Contains(errRefusal.Error(), "Endpoint is unavailable") {
+			t.Errorf("the upstream message must be preserved: %v", errRefusal)
+		}
+	}
+
+	// An untyped credential fault is still a credential fault: the host must see
+	// the 403 so it can cool this key and fail over to another one.
+	credential := []byte(`{"error":{"code":403,"status":"UNKNOWN","message":"Invalid API key."}}`)
+	errCredential := upstreamError(http.StatusForbidden, credential, "keyqq2")
+	if got := abi.Status(errCredential); got != http.StatusForbidden {
+		t.Errorf("credential 403 status = %d, want 403", got)
+	}
+	if !strings.Contains(errCredential.Error(), "[keyqq2]") {
+		t.Errorf("a credential 403 should name the key: %v", errCredential)
+	}
+}
+
 func TestRetryableStatus(t *testing.T) {
 	retryable := []int{401, 403, 408, 429, 500, 502, 503, 504}
 	for _, status := range retryable {
