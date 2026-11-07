@@ -1293,6 +1293,30 @@ func TestAdmissionRefusalRetryDelay(t *testing.T) {
 			ok:    true,
 		},
 		{
+			// Observed on api-vps from 2026-11-05 18:17: the same capacity
+			// refusal, now tagged prefill_cap_refused, still carries the hint.
+			name:  "prefill cap refusal is absorbed after its hint",
+			body:  `{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 5 s)"}}`,
+			delay: 5 * time.Second,
+			ok:    true,
+		},
+		{
+			// Observed on api-vps from 2026-11-05 18:58: gateway load shedding
+			// carries no numeric hint, so the short fallback applies.
+			name:  "overload refusal is absorbed without a hint",
+			body:  `{"error":{"type":"server_error","message":"Upstream request failed: [overloaded] the server is overloaded; retry shortly"}}`,
+			delay: endpointUnavailableRetryDelay,
+			ok:    true,
+		},
+		{
+			// The classifier must not depend on the bracketed tag: upstream
+			// renamed it twice in one day, and the sentence is the stable part.
+			name:  "a renamed tag does not hide the capacity refusal",
+			body:  `{"error":{"message":"Upstream request failed: [some_future_refusal] the cell is at capacity; retry shortly (after 3 s)"}}`,
+			delay: 3 * time.Second,
+			ok:    true,
+		},
+		{
 			name: "quota failure is not an admission refusal",
 			body: `{"error":{"code":"GoUsageLimitError","message":"Go usage limit exceeded"}}`,
 		},
@@ -1375,6 +1399,92 @@ func TestExecuteAdmissionRetryIsBounded(t *testing.T) {
 	})
 	if errExecute == nil {
 		t.Fatal("a persistent admission refusal must surface as an error")
+	}
+	if got := abi.Status(errExecute); got != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", got)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry only)", got)
+	}
+}
+
+func TestExecuteRetriesCapacityRefusals(t *testing.T) {
+	// Both shapes were observed on api-vps after the upstream renamed the
+	// admission-refusal tag: the same transient capacity signal must be
+	// absorbed once instead of cooling a key that still has quota.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "prefill cap refusal",
+			body: `{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 0 s)"}}`,
+		},
+		{
+			name: "overload refusal",
+			body: `{"error":{"type":"server_error","message":"Upstream request failed: [overloaded] the server is overloaded; retry shortly"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if calls.Add(1) == 1 {
+					writer.WriteHeader(http.StatusTooManyRequests)
+					_, _ = writer.Write([]byte(tc.body))
+					return
+				}
+				writer.WriteHeader(http.StatusOK)
+				_, _ = writer.Write([]byte(`{"id":"ok","choices":[{"message":{"content":"ok"}}]}`))
+			}))
+			defer server.Close()
+
+			settings := config.Default()
+			settings.BaseURL = server.URL
+			settings.EndpointLayout = config.LayoutFamily
+			settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+			client := New(settings)
+
+			result, errExecute := client.Execute(t.Context(), Call{
+				Role:  roles.ByName("chat"),
+				Model: "deepseek-v4.1-flash",
+				Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+			})
+			if errExecute != nil {
+				t.Fatalf("Execute must retry the capacity refusal: %v", errExecute)
+			}
+			if result.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want 200", result.StatusCode)
+			}
+			if got := calls.Load(); got != 2 {
+				t.Errorf("upstream calls = %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestExecuteOverloadRetryIsBounded(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = writer.Write([]byte(`{"error":{"type":"server_error","message":"Upstream request failed: [overloaded] the server is overloaded; retry shortly"}}`))
+	}))
+	defer server.Close()
+
+	settings := config.Default()
+	settings.BaseURL = server.URL
+	settings.EndpointLayout = config.LayoutFamily
+	settings.Keys = []config.Key{{Name: "k1", Key: "test-key"}}
+	client := New(settings)
+
+	_, errExecute := client.Execute(t.Context(), Call{
+		Role:  roles.ByName("chat"),
+		Model: "deepseek-v4.1-flash",
+		Body:  []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if errExecute == nil {
+		t.Fatal("a persistent overload refusal must surface as an error")
 	}
 	if got := abi.Status(errExecute); got != http.StatusTooManyRequests {
 		t.Errorf("status = %d, want 429", got)

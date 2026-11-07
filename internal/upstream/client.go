@@ -37,13 +37,26 @@ const endpointUnavailableRetryDelay = 300 * time.Millisecond
 // the cap keeps a stale or hostile hint from parking a request for minutes.
 const admissionRetryMaxDelay = 30 * time.Second
 
-// admissionRefusalHint matches the retry hint OpenCode Go appends to an
-// admission refusal: "[ttft_admission_refused] the cell is at capacity; retry
-// shortly (after 16 s)".
+// admissionRefusalHint matches the retry hint OpenCode Go appends to a
+// capacity refusal: "the cell is at capacity; retry shortly (after 16 s)".
 var admissionRefusalHint = regexp.MustCompile(`after\s+([0-9]{1,4})\s*s`)
 
+// admissionRefusalMarkers are the stable fragments OpenCode Go uses in a 429
+// that is a verdict on the gateway cell or node rather than on the credential.
+// The bracketed tag in front of the message is not stable: the same "retry
+// shortly" capacity refusal has shipped as "[ttft_admission_refused]",
+// "[prefill_cap_refused]" and "[overloaded]" within one day. Matching only the
+// first tag let the other two through, so every refusal cooled a key that
+// still had quota. Match the sentence instead of the tag.
+var admissionRefusalMarkers = [][]byte{
+	[]byte("ttft_admission_refused"),
+	[]byte("prefill_cap_refused"),
+	[]byte("the cell is at capacity"),
+	[]byte("the server is overloaded"),
+}
+
 // admissionRefusalRetryDelay reports how long to wait before retrying a 429
-// that is an admission refusal rather than a verdict on the credential.
+// that is a capacity/overload refusal rather than a verdict on the credential.
 //
 // The refusal means the gateway cell that would run this request is full, not
 // that the key ran out of quota, and the upstream says when to come back.
@@ -53,11 +66,19 @@ var admissionRefusalHint = regexp.MustCompile(`after\s+([0-9]{1,4})\s*s`)
 // blip from turning into a credential cooldown, which is strictly worse for
 // every following request on the same key.
 func admissionRefusalRetryDelay(body []byte) (time.Duration, bool) {
-	if !bytes.Contains(body, []byte("ttft_admission_refused")) {
+	lower := bytes.ToLower(body)
+	refusal := false
+	for _, marker := range admissionRefusalMarkers {
+		if bytes.Contains(lower, marker) {
+			refusal = true
+			break
+		}
+	}
+	if !refusal {
 		return 0, false
 	}
 	delay := endpointUnavailableRetryDelay
-	if match := admissionRefusalHint.FindSubmatch(body); match != nil {
+	if match := admissionRefusalHint.FindSubmatch(lower); match != nil {
 		if seconds, errAtoi := strconv.Atoi(string(match[1])); errAtoi == nil && seconds > 0 {
 			delay = time.Duration(seconds) * time.Second
 		}
@@ -389,14 +410,16 @@ func (c *Client) do(ctx context.Context, call Call, credential config.Key, setti
 			response.Body = io.NopCloser(bytes.NewReader(peeked))
 		}
 		// A 429 is not always a credential verdict. OpenCode Go answers a full
-		// gateway cell with "[ttft_admission_refused] the cell is at capacity"
-		// plus a retry hint, and it occasionally hides the same gateway hiccup
-		// behind an opaque 429 whose body is just {"model":"..."} or behind a
-		// 429 whose body is the "Endpoint is unavailable" server error. None of
-		// them is a quota failure, but CLIProxyAPI cools the key on every 429;
-		// retrying the same key once here keeps a capacity blip from escalating
-		// into a cooldown that outlives the blip. Quota and auth 429s are
-		// untouched: they must reach the host so it can cool the key and switch.
+		// gateway cell with "the cell is at capacity; retry shortly (after N s)"
+		// and sheds load with "the server is overloaded; retry shortly"; the
+		// bracketed tag in front of either sentence changes between upstream
+		// builds. It also occasionally hides the same gateway hiccup behind an
+		// opaque 429 whose body is just {"model":"..."} or behind a 429 whose
+		// body is the "Endpoint is unavailable" server error. None of them is a
+		// quota failure, but CLIProxyAPI cools the key on every 429; retrying
+		// the same key once here keeps a capacity blip from escalating into a
+		// cooldown that outlives the blip. Quota and auth 429s are untouched:
+		// they must reach the host so it can cool the key and switch.
 		if response.StatusCode == http.StatusTooManyRequests && !admissionRetried && attempt < 2 {
 			peeked, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBody))
 			_ = response.Body.Close()
